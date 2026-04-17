@@ -4,6 +4,7 @@ package transformer
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,9 @@ import (
 
 	"oc-go-cc/pkg/types"
 )
+
+// ErrClientDisconnected is returned when the client disconnects during streaming.
+var ErrClientDisconnected = fmt.Errorf("client disconnected")
 
 // StreamHandler handles streaming SSE transformation from OpenAI to Anthropic format.
 type StreamHandler struct {
@@ -28,17 +32,13 @@ func NewStreamHandler() *StreamHandler {
 
 // ProxyStream takes an OpenAI streaming response and writes Anthropic-format SSE to the writer.
 // It reads OpenAI ChatCompletionChunk SSE events and transforms them into Anthropic MessageEvent SSE events.
+// The clientCtx is used to detect client disconnection and abort early.
 func (h *StreamHandler) ProxyStream(
 	w http.ResponseWriter,
 	openaiResp io.ReadCloser,
 	originalModel string,
+	clientCtx context.Context,
 ) error {
-	// Set headers for SSE streaming.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		return fmt.Errorf("streaming not supported by response writer")
@@ -59,7 +59,7 @@ func (h *StreamHandler) ProxyStream(
 		},
 	}
 	if err := writeSSEEvent(w, msgStart); err != nil {
-		return fmt.Errorf("failed to write message_start event: %w", err)
+		return ErrClientDisconnected
 	}
 	flusher.Flush()
 
@@ -69,6 +69,13 @@ func (h *StreamHandler) ProxyStream(
 	var lineBuf bytes.Buffer
 
 	for {
+		// Check if client disconnected before reading next byte
+		select {
+		case <-clientCtx.Done():
+			return ErrClientDisconnected
+		default:
+		}
+
 		b, err := reader.ReadByte()
 		if err != nil {
 			if err == io.EOF {
@@ -117,7 +124,7 @@ func (h *StreamHandler) ProxyStream(
 						},
 					}
 					if err := writeSSEEvent(w, startEvent); err != nil {
-						return fmt.Errorf("failed to write content_block_start: %w", err)
+						return ErrClientDisconnected
 					}
 				}
 
@@ -133,7 +140,7 @@ func (h *StreamHandler) ProxyStream(
 				}
 
 				if err := writeSSEEvent(w, event); err != nil {
-					return fmt.Errorf("failed to write content_block_delta: %w", err)
+					return ErrClientDisconnected
 				}
 				flusher.Flush()
 			}
@@ -153,7 +160,7 @@ func (h *StreamHandler) ProxyStream(
 						},
 					}
 					if err := writeSSEEvent(w, startEvent); err != nil {
-						return fmt.Errorf("failed to write tool content_block_start: %w", err)
+						return ErrClientDisconnected
 					}
 
 					// Send input_json_delta for tool arguments.
@@ -170,7 +177,7 @@ func (h *StreamHandler) ProxyStream(
 						}
 
 						if err := writeSSEEvent(w, event); err != nil {
-							return fmt.Errorf("failed to write input_json_delta: %w", err)
+							return ErrClientDisconnected
 						}
 					}
 					flusher.Flush()
@@ -185,7 +192,7 @@ func (h *StreamHandler) ProxyStream(
 					Index: &contentIndex,
 				}
 				if err := writeSSEEvent(w, stopEvent); err != nil {
-					return fmt.Errorf("failed to write content_block_stop: %w", err)
+					return ErrClientDisconnected
 				}
 
 				// Build usage delta from chunk usage if available.
@@ -206,7 +213,7 @@ func (h *StreamHandler) ProxyStream(
 					Usage: usage,
 				}
 				if err := writeSSEEvent(w, msgDelta); err != nil {
-					return fmt.Errorf("failed to write message_delta: %w", err)
+					return ErrClientDisconnected
 				}
 
 				flusher.Flush()
@@ -221,7 +228,7 @@ func (h *StreamHandler) ProxyStream(
 		Type: "message_stop",
 	}
 	if err := writeSSEEvent(w, stopEvent); err != nil {
-		return fmt.Errorf("failed to write message_stop: %w", err)
+		return ErrClientDisconnected
 	}
 	flusher.Flush()
 

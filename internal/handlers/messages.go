@@ -211,21 +211,43 @@ func (h *MessagesHandler) handleStreaming(
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
 ) {
-	// Use background context with timeout - detached from HTTP request context but with timeout
-	// The HTTP context gets canceled when the client disconnects or when
-	// concurrent requests interfere, but streaming needs to continue independently.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// Use background context with timeout for upstream calls - detached from HTTP request context
+	// so upstream requests don't get canceled by client disconnect.
+	// But we also keep the request context to detect client disconnection.
+	upstreamCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	clientCtx := r.Context()
 
 	rw := &responseWriter{ResponseWriter: w}
 
+	// Set SSE headers immediately so Claude Code knows the stream is alive.
+	// This prevents client-side timeouts before we even start sending data.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
 	for _, model := range modelChain {
+		// If the client already disconnected, stop trying fallbacks.
+		if isClientDisconnected(r) {
+			h.logger.Info("client disconnected, stopping streaming fallbacks")
+			return
+		}
+
 		h.logger.Info("attempting streaming model", "model", model.ModelID)
 
 		// Check if this is an Anthropic-native model (MiniMax)
 		if client.IsAnthropicModel(model.ModelID) {
 			// For MiniMax models, send raw Anthropic request to Anthropic endpoint
-			if err := h.handleAnthropicStreaming(ctx, rw, rawBody, model.ModelID); err != nil {
+			if err := h.handleAnthropicStreaming(upstreamCtx, rw, rawBody, model.ModelID, clientCtx); err != nil {
+				if err == transformer.ErrClientDisconnected {
+					h.logger.Info("client disconnected during stream")
+					return
+				}
 				h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
 				continue
 			}
@@ -241,7 +263,7 @@ func (h *MessagesHandler) handleStreaming(
 		}
 
 		// Get streaming body from upstream
-		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq)
+		streamBody, err := h.client.GetStreamingBody(upstreamCtx, model.ModelID, openaiReq)
 		if err != nil {
 			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
 			continue
@@ -249,7 +271,11 @@ func (h *MessagesHandler) handleStreaming(
 		defer streamBody.Close()
 
 		// Proxy the stream: transform OpenAI SSE → Anthropic SSE in real-time
-		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID); err != nil {
+		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
+			if err == transformer.ErrClientDisconnected {
+				h.logger.Info("client disconnected during stream")
+				return
+			}
 			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", err)
 			continue
 		}
@@ -267,31 +293,52 @@ func (h *MessagesHandler) handleStreaming(
 	}
 }
 
+// isClientDisconnected checks if the HTTP client has disconnected.
+func isClientDisconnected(r *http.Request) bool {
+	select {
+	case <-r.Context().Done():
+		return true
+	default:
+		return false
+	}
+}
+
 // handleAnthropicStreaming sends a raw Anthropic request to the Anthropic endpoint.
 func (h *MessagesHandler) handleAnthropicStreaming(
-	ctx context.Context,
+	upstreamCtx context.Context,
 	w http.ResponseWriter,
 	rawBody json.RawMessage,
 	modelID string,
+	clientCtx context.Context,
 ) error {
 	// Send raw Anthropic request to Anthropic endpoint
-	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, true)
+	resp, err := h.client.SendAnthropicRequest(upstreamCtx, rawBody, true)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	// Set SSE headers
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-
 	// Copy the response directly (already in Anthropic format)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		return fmt.Errorf("failed to copy response: %w", err)
-	}
+	// SSE headers already set by handleStreaming
+	// Monitor client context - abort if client disconnects
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
 
-	return nil
+	go func() {
+		_, copyErr := io.Copy(w, resp.Body)
+		errCh <- copyErr
+		close(done)
+	}()
+
+	select {
+	case <-clientCtx.Done():
+		return transformer.ErrClientDisconnected
+	case copyErr := <-errCh:
+		if copyErr != nil {
+			return fmt.Errorf("failed to copy response: %w", copyErr)
+		}
+		return nil
+	}
 }
 
 // sendStreamError sends an error event in the SSE stream.
