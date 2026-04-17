@@ -59,3 +59,33 @@ func (rr *RouteResult) GetModelChain() []config.ModelConfig {
 	chain = append(chain, rr.Fallbacks...)
 	return chain
 }
+
+// RouteForStreaming determines which model to use for streaming requests.
+// Prioritizes fast TTFT (time-to-first-token) over capability.
+func (r *ModelRouter) RouteForStreaming(messages []MessageContent, tokenCount int) RouteResult {
+	result := RouteForStreaming(messages, tokenCount, r.config)
+
+	// Get primary model for scenario
+	primary, ok := r.config.Models[string(result.Scenario)]
+	if !ok {
+		// Fall back to fast scenario if not configured
+		primary, ok = r.config.Models["fast"]
+		if !ok {
+			// Fall back to default
+			primary = r.config.Models["default"]
+		}
+	}
+
+	// Get fallbacks for scenario
+	fallbacks := r.config.Fallbacks[string(result.Scenario)]
+	if len(fallbacks) == 0 {
+		// Fall back to fast fallbacks
+		fallbacks = r.config.Fallbacks["fast"]
+	}
+
+	return RouteResult{
+		Primary:   primary,
+		Fallbacks: fallbacks,
+		Scenario:  result.Scenario,
+	}
+}

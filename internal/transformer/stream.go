@@ -2,7 +2,6 @@
 package transformer
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -33,6 +32,9 @@ func NewStreamHandler() *StreamHandler {
 // ProxyStream takes an OpenAI streaming response and writes Anthropic-format SSE to the writer.
 // It reads OpenAI ChatCompletionChunk SSE events and transforms them into Anthropic MessageEvent SSE events.
 // The clientCtx is used to detect client disconnection and abort early.
+//
+// CRITICAL: This function reads directly from resp.Body without buffering to minimize latency.
+// Per deep research: "Don't use bufio.Scanner or bufio.Reader on the response body - it adds buffering"
 func (h *StreamHandler) ProxyStream(
 	w http.ResponseWriter,
 	openaiResp io.ReadCloser,
@@ -63,163 +65,53 @@ func (h *StreamHandler) ProxyStream(
 	}
 	flusher.Flush()
 
-	// Use bufio.Reader for real-time reading (Scanner buffers entire lines).
-	reader := bufio.NewReader(openaiResp)
+	// Read directly from response body without buffering.
+	// Use a tight loop with a line buffer - no bufio.Reader.
 	contentIndex := 0
 	var lineBuf bytes.Buffer
+	contentStarted := false
+
+	// Read in larger chunks for efficiency, then parse lines
+	readBuf := make([]byte, 4096)
 
 	for {
-		// Check if client disconnected before reading next byte
+		// Check if client disconnected
 		select {
 		case <-clientCtx.Done():
 			return ErrClientDisconnected
 		default:
 		}
 
-		b, err := reader.ReadByte()
-		if err != nil {
-			if err == io.EOF {
-				break
+		// Read chunk from upstream
+		n, err := openaiResp.Read(readBuf)
+		if n > 0 {
+			// Process bytes immediately
+			for i := 0; i < n; i++ {
+				b := readBuf[i]
+				if b == '\n' {
+					line := lineBuf.String()
+					lineBuf.Reset()
+
+					// Process complete line
+					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, originalModel); err != nil {
+						return err
+					}
+				} else {
+					lineBuf.WriteByte(b)
+				}
 			}
-			return fmt.Errorf("failed to read stream: %w", err)
 		}
 
-		if b == '\n' {
-			line := lineBuf.String()
-			lineBuf.Reset()
-
-			// Skip empty lines and non-data lines
-			if !strings.HasPrefix(line, "data: ") {
-				continue
+		if err == io.EOF {
+			// Process any remaining data in buffer
+			if lineBuf.Len() > 0 {
+				line := lineBuf.String()
+				h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, originalModel)
 			}
-
-			data := strings.TrimPrefix(line, "data: ")
-			if data == "[DONE]" {
-				break
-			}
-			if data == "" {
-				continue
-			}
-
-			var chunk types.ChatCompletionChunk
-			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				continue
-			}
-
-			if len(chunk.Choices) == 0 {
-				continue
-			}
-
-			choice := chunk.Choices[0]
-
-			// Handle text content deltas.
-			if choice.Delta.Content != "" {
-				// Send content_block_start for the first text delta.
-				if contentIndex == 0 {
-					startEvent := types.MessageEvent{
-						Type:  "content_block_start",
-						Index: &contentIndex,
-						Delta: &types.Delta{
-							Type: "text",
-						},
-					}
-					if err := writeSSEEvent(w, startEvent); err != nil {
-						return ErrClientDisconnected
-					}
-				}
-
-				delta := types.Delta{
-					Type: "text_delta",
-					Text: choice.Delta.Content,
-				}
-
-				event := types.MessageEvent{
-					Type:  "content_block_delta",
-					Index: &contentIndex,
-					Delta: &delta,
-				}
-
-				if err := writeSSEEvent(w, event); err != nil {
-					return ErrClientDisconnected
-				}
-				flusher.Flush()
-			}
-
-			// Handle tool call deltas.
-			if len(choice.Delta.ToolCalls) > 0 {
-				for _, tc := range choice.Delta.ToolCalls {
-					// Increment index for each tool call block.
-					contentIndex++
-
-					// Send content_block_start for tool use.
-					startEvent := types.MessageEvent{
-						Type:  "content_block_start",
-						Index: &contentIndex,
-						Delta: &types.Delta{
-							Type: "tool_use",
-						},
-					}
-					if err := writeSSEEvent(w, startEvent); err != nil {
-						return ErrClientDisconnected
-					}
-
-					// Send input_json_delta for tool arguments.
-					if tc.Function.Arguments != "" {
-						delta := types.Delta{
-							Type:        "input_json_delta",
-							PartialJSON: tc.Function.Arguments,
-						}
-
-						event := types.MessageEvent{
-							Type:  "content_block_delta",
-							Index: &contentIndex,
-							Delta: &delta,
-						}
-
-						if err := writeSSEEvent(w, event); err != nil {
-							return ErrClientDisconnected
-						}
-					}
-					flusher.Flush()
-				}
-			}
-
-			// Handle finish reason — stream is ending.
-			if choice.FinishReason != "" {
-				// Send content_block_stop for the last active block.
-				stopEvent := types.MessageEvent{
-					Type:  "content_block_stop",
-					Index: &contentIndex,
-				}
-				if err := writeSSEEvent(w, stopEvent); err != nil {
-					return ErrClientDisconnected
-				}
-
-				// Build usage delta from chunk usage if available.
-				var usage *types.Usage
-				if chunk.Usage != nil {
-					usage = &types.Usage{
-						InputTokens:  chunk.Usage.PromptTokens,
-						OutputTokens: chunk.Usage.CompletionTokens,
-					}
-				}
-
-				// Send message_delta with stop reason and usage.
-				msgDelta := types.MessageEvent{
-					Type: "message_delta",
-					Delta: &types.Delta{
-						StopReason: h.responseTransformer.mapFinishReason(choice.FinishReason),
-					},
-					Usage: usage,
-				}
-				if err := writeSSEEvent(w, msgDelta); err != nil {
-					return ErrClientDisconnected
-				}
-
-				flusher.Flush()
-			}
-		} else {
-			lineBuf.WriteByte(b)
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read stream: %w", err)
 		}
 	}
 
@@ -231,6 +123,218 @@ func (h *StreamHandler) ProxyStream(
 		return ErrClientDisconnected
 	}
 	flusher.Flush()
+
+	return nil
+}
+
+// processSSELine processes a single SSE line from upstream.
+// Per deep research: "Treat SSE primarily as a text protocol" - minimize JSON parsing.
+func (h *StreamHandler) processSSELine(
+	w http.ResponseWriter,
+	flusher http.Flusher,
+	line string,
+	contentIndex *int,
+	contentStarted *bool,
+	originalModel string,
+) error {
+	line = strings.TrimSpace(line)
+
+	// Skip empty lines
+	if line == "" {
+		return nil
+	}
+
+	// Skip non-data lines (event: lines, id: lines, etc.)
+	if !strings.HasPrefix(line, "data: ") {
+		return nil
+	}
+
+	data := strings.TrimPrefix(line, "data: ")
+	if data == "" {
+		return nil
+	}
+
+	// Handle [DONE] marker
+	if data == "[DONE]" {
+		return nil
+	}
+
+	// Fast path: check if this is a content chunk without full JSON parsing
+	// Look for "delta":{"content":" pattern
+	if idx := strings.Index(data, `"delta":{"content":"`); idx != -1 {
+		// Extract content directly
+		start := idx + len(`"delta":{"content":"`)
+		end := strings.Index(data[start:], `"`)
+		if end != -1 {
+			content := data[start : start+end]
+			if content != "" {
+				if !*contentStarted {
+					*contentStarted = true
+					// Send content_block_start
+					startEvent := types.MessageEvent{
+						Type:  "content_block_start",
+						Index: contentIndex,
+						Delta: &types.Delta{
+							Type: "text",
+						},
+					}
+					if err := writeSSEEvent(w, startEvent); err != nil {
+						return ErrClientDisconnected
+					}
+				}
+
+				// Send content_block_delta
+				delta := types.Delta{
+					Type: "text_delta",
+					Text: content,
+				}
+				event := types.MessageEvent{
+					Type:  "content_block_delta",
+					Index: contentIndex,
+					Delta: &delta,
+				}
+				if err := writeSSEEvent(w, event); err != nil {
+					return ErrClientDisconnected
+				}
+				flusher.Flush()
+			}
+			return nil
+		}
+	}
+
+	// Check for finish_reason - need to send stop events
+	if strings.Contains(data, `"finish_reason":`) && !strings.Contains(data, `"finish_reason":null`) {
+		// Send content_block_stop
+		stopEvent := types.MessageEvent{
+			Type:  "content_block_stop",
+			Index: contentIndex,
+		}
+		if err := writeSSEEvent(w, stopEvent); err != nil {
+			return ErrClientDisconnected
+		}
+
+		// Send message_delta with stop_reason
+		msgDelta := types.MessageEvent{
+			Type: "message_delta",
+			Delta: &types.Delta{
+				StopReason: "end_turn", // Simplified - OpenAI usually sends "stop"
+			},
+		}
+		if err := writeSSEEvent(w, msgDelta); err != nil {
+			return ErrClientDisconnected
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	// For tool calls and other complex cases, fall back to full JSON parsing
+	var chunk types.ChatCompletionChunk
+	if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+		// Skip malformed chunks - don't fail the whole stream
+		return nil
+	}
+
+	if len(chunk.Choices) == 0 {
+		return nil
+	}
+
+	choice := chunk.Choices[0]
+
+	// Handle text content deltas
+	if choice.Delta.Content != "" {
+		if !*contentStarted {
+			*contentStarted = true
+			startEvent := types.MessageEvent{
+				Type:  "content_block_start",
+				Index: contentIndex,
+				Delta: &types.Delta{
+					Type: "text",
+				},
+			}
+			if err := writeSSEEvent(w, startEvent); err != nil {
+				return ErrClientDisconnected
+			}
+		}
+
+		delta := types.Delta{
+			Type: "text_delta",
+			Text: choice.Delta.Content,
+		}
+		event := types.MessageEvent{
+			Type:  "content_block_delta",
+			Index: contentIndex,
+			Delta: &delta,
+		}
+		if err := writeSSEEvent(w, event); err != nil {
+			return ErrClientDisconnected
+		}
+		flusher.Flush()
+	}
+
+	// Handle tool call deltas
+	if len(choice.Delta.ToolCalls) > 0 {
+		for _, tc := range choice.Delta.ToolCalls {
+			*contentIndex++
+
+			startEvent := types.MessageEvent{
+				Type:  "content_block_start",
+				Index: contentIndex,
+				Delta: &types.Delta{
+					Type: "tool_use",
+				},
+			}
+			if err := writeSSEEvent(w, startEvent); err != nil {
+				return ErrClientDisconnected
+			}
+
+			if tc.Function.Arguments != "" {
+				delta := types.Delta{
+					Type:        "input_json_delta",
+					PartialJSON: tc.Function.Arguments,
+				}
+				event := types.MessageEvent{
+					Type:  "content_block_delta",
+					Index: contentIndex,
+					Delta: &delta,
+				}
+				if err := writeSSEEvent(w, event); err != nil {
+					return ErrClientDisconnected
+				}
+			}
+			flusher.Flush()
+		}
+	}
+
+	// Handle finish reason
+	if choice.FinishReason != "" {
+		stopEvent := types.MessageEvent{
+			Type:  "content_block_stop",
+			Index: contentIndex,
+		}
+		if err := writeSSEEvent(w, stopEvent); err != nil {
+			return ErrClientDisconnected
+		}
+
+		var usage *types.Usage
+		if chunk.Usage != nil {
+			usage = &types.Usage{
+				InputTokens:  chunk.Usage.PromptTokens,
+				OutputTokens: chunk.Usage.CompletionTokens,
+			}
+		}
+
+		msgDelta := types.MessageEvent{
+			Type: "message_delta",
+			Delta: &types.Delta{
+				StopReason: h.responseTransformer.mapFinishReason(choice.FinishReason),
+			},
+			Usage: usage,
+		}
+		if err := writeSSEEvent(w, msgDelta); err != nil {
+			return ErrClientDisconnected
+		}
+		flusher.Flush()
+	}
 
 	return nil
 }

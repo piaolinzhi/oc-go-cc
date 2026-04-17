@@ -323,6 +323,12 @@ func getDefaultConfig() string {
       "model_id": "glm-5.1",
       "temperature": 0.7,
       "max_tokens": 4096
+    },
+    "fast": {
+      "provider": "opencode-go",
+      "model_id": "qwen3.6-plus",
+      "temperature": 0.7,
+      "max_tokens": 4096
     }
   },
   "fallbacks": {
@@ -349,6 +355,10 @@ func getDefaultConfig() string {
     "complex": [
       { "provider": "opencode-go", "model_id": "glm-5" },
       { "provider": "opencode-go", "model_id": "kimi-k2.5" }
+    ],
+    "fast": [
+      { "provider": "opencode-go", "model_id": "qwen3.5-plus" },
+      { "provider": "opencode-go", "model_id": "minimax-m2.5" }
     ]
   },
   "opencode_go": {

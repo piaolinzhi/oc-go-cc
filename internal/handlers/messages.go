@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"oc-go-cc/internal/client"
@@ -179,10 +180,17 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Route to appropriate model.
-	routeResult, err := h.modelRouter.Route(routerMessages, tokenCount)
-	if err != nil {
-		h.sendError(w, http.StatusInternalServerError, "routing failed", err)
-		return
+	// For streaming, use faster models to minimize TTFT (time-to-first-token)
+	var routeResult router.RouteResult
+	if isStreaming {
+		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
+	} else {
+		var err error
+		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount)
+		if err != nil {
+			h.sendError(w, http.StatusInternalServerError, "routing failed", err)
+			return
+		}
 	}
 
 	h.logger.Info("routing request",
@@ -211,11 +219,9 @@ func (h *MessagesHandler) handleStreaming(
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
 ) {
-	// Use background context with timeout for upstream calls - detached from HTTP request context
-	// so upstream requests don't get canceled by client disconnect.
-	// But we also keep the request context to detect client disconnection.
-	upstreamCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	// Each fallback attempt needs its own context with timeout.
+	// Don't share r.Context() across fallbacks - when Claude Code retries,
+	// the original context gets canceled and kills all fallbacks.
 	clientCtx := r.Context()
 
 	rw := &responseWriter{ResponseWriter: w}
@@ -232,17 +238,18 @@ func (h *MessagesHandler) handleStreaming(
 	}
 
 	// Start heartbeat to keep connection alive while waiting for upstream.
-	// Claude Code times out after ~6 seconds of no data, so we send pings every 2 seconds.
+	// Claude Code times out after ~6 seconds of no data, so we send pings every 3 seconds
+	// (frequent enough to prevent timeout, not so frequent as to cause overhead).
 	heartbeatDone := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
 
 		for {
 			select {
 			case <-ticker.C:
 				// Send SSE comment (ignored by client but keeps connection alive)
-				fmt.Fprintf(w, ":heartbeat\n\n")
+				fmt.Fprintf(w, ":keepalive\n\n")
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
@@ -256,60 +263,93 @@ func (h *MessagesHandler) handleStreaming(
 	// Stop heartbeat when streaming completes
 	defer close(heartbeatDone)
 
+	streamStart := time.Now()
+
 	for _, model := range modelChain {
-		// If the client already disconnected, stop trying fallbacks.
-		if isClientDisconnected(r) {
+		// Check if client already disconnected before trying this model
+		select {
+		case <-clientCtx.Done():
 			h.logger.Info("client disconnected, stopping streaming fallbacks")
 			return
+		default:
 		}
 
 		h.logger.Info("attempting streaming model", "model", model.ModelID)
 
+		// Create a fresh context with timeout for THIS attempt only.
+		// Don't use r.Context() directly - it gets canceled when Claude Code retries.
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+
 		// Check if this is an Anthropic-native model (MiniMax)
 		if client.IsAnthropicModel(model.ModelID) {
 			// For MiniMax models, send raw Anthropic request to Anthropic endpoint
-			if err := h.handleAnthropicStreaming(upstreamCtx, rw, rawBody, model.ModelID, clientCtx); err != nil {
-				if err == transformer.ErrClientDisconnected {
-					h.logger.Info("client disconnected during stream")
+			// But we need to replace the model name in the raw body
+			modelBody := replaceModelInRawBody(rawBody, model.ModelID)
+			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID); err != nil {
+				cancel()
+				// Check if this was a client disconnect
+				if clientCtx.Err() == context.Canceled {
+					h.logger.Info("client disconnected during anthropic stream")
 					return
 				}
 				h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
 				continue
 			}
-			h.logger.Info("streaming completed", "model", model.ModelID)
+			cancel()
+			latency := time.Since(streamStart)
+			h.metrics.RecordSuccess(model.ModelID, latency)
+			h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
 			return
 		}
 
 		// For OpenAI-compatible models, transform and send to OpenAI endpoint
 		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
 		if err != nil {
+			cancel()
 			h.logger.Warn("request transform failed", "model", model.ModelID, "error", err)
 			continue
 		}
 
 		// Get streaming body from upstream
-		streamBody, err := h.client.GetStreamingBody(upstreamCtx, model.ModelID, openaiReq)
+		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq)
 		if err != nil {
+			cancel()
+			// Check if this was a client disconnect (context canceled)
+			if clientCtx.Err() == context.Canceled {
+				h.logger.Info("client disconnected during upstream request")
+				return
+			}
 			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
 			continue
 		}
-		defer streamBody.Close()
 
 		// Proxy the stream: transform OpenAI SSE → Anthropic SSE in real-time
 		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
+			streamBody.Close()
+			cancel()
 			if err == transformer.ErrClientDisconnected {
 				h.logger.Info("client disconnected during stream")
+				return
+			}
+			// Check if this was a client disconnect
+			if clientCtx.Err() == context.Canceled {
+				h.logger.Info("client disconnected during stream (context canceled)")
 				return
 			}
 			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", err)
 			continue
 		}
 
-		h.logger.Info("streaming completed", "model", model.ModelID)
+		streamBody.Close()
+		cancel()
+		latency := time.Since(streamStart)
+		h.metrics.RecordSuccess(model.ModelID, latency)
+		h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
 		return
 	}
 
 	// All models failed
+	h.metrics.RecordFailure()
 	if !rw.wroteHeader {
 		h.sendError(w, http.StatusBadGateway, "all streaming models failed", nil)
 	} else {
@@ -328,16 +368,56 @@ func isClientDisconnected(r *http.Request) bool {
 	}
 }
 
+// replaceModelInRawBody replaces the model field in raw JSON body with the actual model ID.
+// This is needed for Anthropic endpoint which validates the model name.
+func replaceModelInRawBody(rawBody json.RawMessage, modelID string) json.RawMessage {
+	// Simple string replacement - find "model":"..." and replace with "model":"actual-model"
+	bodyStr := string(rawBody)
+
+	// Try to find and replace the model field
+	// Pattern: "model":"claude-..." or "model":"any-model-name"
+	if idx := strings.Index(bodyStr, `"model":"`); idx != -1 {
+		start := idx + len(`"model":"`)
+		if end := strings.Index(bodyStr[start:], `"`); end != -1 {
+			oldModel := bodyStr[start : start+end]
+			// Replace the model value
+			newBody := bodyStr[:start] + modelID + bodyStr[start+end:]
+			slog.Debug("replaced model in request body",
+				"old_model", oldModel,
+				"new_model", modelID,
+				"success", true)
+			return json.RawMessage(newBody)
+		}
+	}
+
+	slog.Warn("could not find model field in request body, using original",
+		"body_preview", bodyStr[:min(len(bodyStr), 200)])
+	// If we couldn't parse, return original (will likely fail upstream but that's ok)
+	return rawBody
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // handleAnthropicStreaming sends a raw Anthropic request to the Anthropic endpoint.
 func (h *MessagesHandler) handleAnthropicStreaming(
-	upstreamCtx context.Context,
+	ctx context.Context,
 	w http.ResponseWriter,
 	rawBody json.RawMessage,
 	modelID string,
-	clientCtx context.Context,
 ) error {
+	// Debug: Log what we're sending
+	h.logger.Debug("sending anthropic streaming request",
+		"model_id", modelID,
+		"body_preview", string(rawBody)[:min(len(rawBody), 200)])
+
 	// Send raw Anthropic request to Anthropic endpoint
-	resp, err := h.client.SendAnthropicRequest(upstreamCtx, rawBody, true)
+	// Use ctx so cancellation propagates when client disconnects
+	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, true)
 	if err != nil {
 		return err
 	}
@@ -345,25 +425,17 @@ func (h *MessagesHandler) handleAnthropicStreaming(
 
 	// Copy the response directly (already in Anthropic format)
 	// SSE headers already set by handleStreaming
-	// Monitor client context - abort if client disconnects
-	done := make(chan struct{})
-	errCh := make(chan error, 1)
-
-	go func() {
-		_, copyErr := io.Copy(w, resp.Body)
-		errCh <- copyErr
-		close(done)
-	}()
-
-	select {
-	case <-clientCtx.Done():
-		return transformer.ErrClientDisconnected
-	case copyErr := <-errCh:
-		if copyErr != nil {
-			return fmt.Errorf("failed to copy response: %w", copyErr)
+	// Use io.Copy which handles streaming efficiently
+	_, err = io.Copy(w, resp.Body)
+	if err != nil {
+		// Check if this was a client disconnect
+		if ctx.Err() == context.Canceled {
+			return transformer.ErrClientDisconnected
 		}
-		return nil
+		return fmt.Errorf("failed to copy response: %w", err)
 	}
+
+	return nil
 }
 
 // sendStreamError sends an error event in the SSE stream.
@@ -396,6 +468,7 @@ func (h *MessagesHandler) handleNonStreaming(
 	rawBody json.RawMessage,
 ) {
 	ctx := r.Context()
+	startTime := time.Now()
 
 	result, responseBody, err := h.fallbackHandler.ExecuteWithFallback(
 		ctx,
@@ -411,13 +484,18 @@ func (h *MessagesHandler) handleNonStreaming(
 	)
 
 	if err != nil {
+		h.metrics.RecordFailure()
 		h.sendError(w, http.StatusBadGateway, "all models failed", err)
 		return
 	}
 
+	latency := time.Since(startTime)
+	h.metrics.RecordSuccess(result.ModelID, latency)
+
 	h.logger.Info("request completed",
 		"model", result.ModelID,
 		"attempts", result.Attempted,
+		"latency", latency,
 	)
 
 	w.Header().Set("Content-Type", "application/json")

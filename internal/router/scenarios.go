@@ -39,6 +39,8 @@ type MessageContent struct {
 //  3. Think (reasoning patterns)
 //  4. Background (simple operations with NO tools)
 //  5. Default
+//
+// For streaming requests, consider using RouteForStreaming() to prefer faster models.
 func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Config) ScenarioResult {
 	// 1. Check for long context first (most important)
 	threshold := getLongContextThreshold(cfg)
@@ -184,4 +186,38 @@ func getLongContextThreshold(cfg *config.Config) int {
 		return lc.ContextThreshold
 	}
 	return 60000 // Default: 60K tokens
+}
+
+// RouteForStreaming selects a model optimized for streaming latency.
+// For streaming, we prioritize fast TTFT (time-to-first-token) over capability.
+// This may return a less capable model but one that streams faster.
+func RouteForStreaming(messages []MessageContent, tokenCount int, cfg *config.Config) ScenarioResult {
+	// For streaming, use simpler models that have better TTFT
+	// Complex models (GLM, Kimi) are too slow for streaming with many tools
+
+	if tokenCount > 30000 {
+		// High token count - use MiniMax for streaming (supports 1M context, decent TTFT)
+		return ScenarioResult{
+			Scenario:   ScenarioLongContext,
+			TokenCount: tokenCount,
+			Reason:     "high token count streaming - use MiniMax for acceptable TTFT",
+		}
+	}
+
+	if hasComplexPattern(messages) || hasThinkingPattern(messages) {
+		// Complex request but streaming - downgrade to faster model
+		// GLM-5 and Kimi are too slow for streaming with complex prompts
+		return ScenarioResult{
+			Scenario:   ScenarioFast,
+			TokenCount: tokenCount,
+			Reason:     "complex request but streaming - use fast model (qwen3.6-plus) for better TTFT",
+		}
+	}
+
+	// Default to fast scenario for streaming
+	return ScenarioResult{
+		Scenario:   ScenarioFast,
+		TokenCount: tokenCount,
+		Reason:     "streaming request - use fast model (qwen3.6-plus)",
+	}
 }

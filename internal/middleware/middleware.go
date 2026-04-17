@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -145,9 +146,13 @@ func (rl *RateLimiter) Allow(clientIP string) bool {
 // GetClientIP extracts the client IP from an HTTP request.
 func GetClientIP(r *http.Request) string {
 	// Check X-Forwarded-For first (if behind a proxy)
+	// X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
+	// We want the first (leftmost) IP which is the original client.
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-		// Take the first IP in the chain
-		return forwarded
+		if idx := strings.Index(forwarded, ","); idx != -1 {
+			return strings.TrimSpace(forwarded[:idx])
+		}
+		return strings.TrimSpace(forwarded)
 	}
 	// Fall back to RemoteAddr
 	return r.RemoteAddr
