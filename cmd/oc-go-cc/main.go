@@ -307,6 +307,9 @@ func getDefaultConfig() string {
     ],
     "think": [
       { "provider": "opencode-go", "model_id": "glm-5" }
+    ],
+    "long_context": [
+      { "provider": "opencode-go", "model_id": "minimax-m2.5" }
     ]
   },
   "opencode_go": {
@@ -314,7 +317,7 @@ func getDefaultConfig() string {
     "timeout_ms": 300000
   },
   "logging": {
-    "level": "debug",
+    "level": "info",
     "requests": true
   }
 }
