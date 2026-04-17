@@ -21,6 +21,13 @@ OpenCode Go gives you access to powerful open coding models for **$5/month** (th
 
 ## Installation
 
+### Homebrew (macOS & Linux)
+
+```bash
+brew tap samueltuyizere/tap
+brew install oc-go-cc
+```
+
 ### Build from Source
 
 ```bash
@@ -33,10 +40,30 @@ make build
 make install
 ```
 
+### Download a Release Binary
+
+Download the latest release for your platform from the [Releases page](https://github.com/samueltuyizere/oc-go-cc/releases):
+
+| Platform | File |
+|----------|------|
+| macOS (Apple Silicon) | `oc-go-cc_darwin-arm64` |
+| macOS (Intel) | `oc-go-cc_darwin-amd64` |
+| Linux (x86_64) | `oc-go-cc_linux-amd64` |
+| Linux (ARM64) | `oc-go-cc_linux-arm64` |
+| Windows (x86_64) | `oc-go-cc_windows-amd64.exe` |
+| Windows (ARM64) | `oc-go-cc_windows-arm64.exe` |
+
+```bash
+# Example: macOS Apple Silicon
+curl -L -o oc-go-cc https://github.com/samueltuyizere/oc-go-cc/releases/latest/download/oc-go-cc_darwin-arm64
+chmod +x oc-go-cc
+sudo mv oc-go-cc /usr/local/bin/
+```
+
 ### Requirements
 
-- Go 1.21 or later
 - An [OpenCode Go](https://opencode.ai/auth) subscription and API key
+- Go 1.21+ (only needed if building from source)
 
 ## Quick Start
 
@@ -368,21 +395,44 @@ configs/
 ## Development
 
 ```bash
-# Build
+# Build (version auto-detected from git)
 make build
 
 # Run in development mode
 make run
 
-# Run tests
+# Run tests with race detector
 make test
+
+# Run go vet
+make vet
 
 # Clean build artifacts
 make clean
 
 # Install to $GOPATH/bin
 make install
+
+# Build cross-platform release binaries
+make dist
 ```
+
+### Release Process
+
+Releases are automated via GitHub Actions:
+
+1. Push to `main` or merge a PR → workflow runs tests + builds
+2. If tests pass, a new release is created with cross-platform binaries and checksums
+3. The Homebrew tap (`samueltuyizere/homebrew-tap`) is automatically updated with the new version
+
+To create a specific version, tag the commit:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The workflow will use the tag as the release version.
 
 ## License
 

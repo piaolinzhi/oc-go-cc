@@ -14,9 +14,11 @@ import (
 
 const (
 	appName     = "oc-go-cc"
-	appVersion  = "0.1.0"
 	pidFileName = "oc-go-cc.pid"
 )
+
+// Version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
 
 func main() {
 	rootCmd := &cobra.Command{
@@ -27,7 +29,7 @@ subscription with Claude Code. It intercepts Claude Code's Anthropic API request
 transforms them to OpenAI format, and forwards them to OpenCode Go.
 
 Configuration is stored at ~/.config/oc-go-cc/config.json`,
-		Version: appVersion,
+		Version: version,
 	}
 
 	// Add subcommands.
@@ -91,7 +93,7 @@ func serveCmd() *cobra.Command {
 				return fmt.Errorf("failed to create server: %w", err)
 			}
 
-			fmt.Printf("Starting %s v%s\n", appName, appVersion)
+			fmt.Printf("Starting %s v%s\n", appName, version)
 			fmt.Printf("Listening on %s:%d\n", cfg.Host, cfg.Port)
 			fmt.Printf("Forwarding to: %s\n", cfg.OpenCodeGo.BaseURL)
 			fmt.Println()
