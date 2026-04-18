@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
-	"golang.org/x/sys/unix"
 )
 
 // BackgroundOpts are the options passed from the serve command.
@@ -16,7 +15,7 @@ type BackgroundOpts struct {
 }
 
 // ForkIntoBackground starts the current binary as a detached background process.
-// The parent process prints the PID and exits. The child continues as a daemon.
+// Uses nohup to detach from terminal and redirect output.
 func ForkIntoBackground(opts BackgroundOpts) error {
 	paths, err := DefaultPaths()
 	if err != nil {
@@ -26,8 +25,7 @@ func ForkIntoBackground(opts BackgroundOpts) error {
 		return fmt.Errorf("cannot create config directory: %w", err)
 	}
 
-	// Build the re-exec command:
-	//   oc-go-cc serve --_daemonize [--config X] [--port N]
+	// Build args for nohup: nohup oc-go-cc serve --_daemonize [--config X] [--port N]
 	args := []string{"serve", "--_daemonize"}
 	if opts.ConfigPath != "" {
 		args = append(args, "--config", opts.ConfigPath)
@@ -43,24 +41,20 @@ func ForkIntoBackground(opts BackgroundOpts) error {
 	}
 	defer logFile.Close()
 
-	// Start the process as a daemon
-	cmd := exec.Command(paths.BinaryPath, args...)
+	// Use nohup to detach from terminal - works cross-platform
+	cmd := exec.Command("nohup", append([]string{paths.BinaryPath}, args...)...)
 	cmd.Env = os.Environ()
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	// Detach from controlling terminal
-	cmd.SysProcAttr = &unix.SysProcAttr{
-		Setpgid: true,
-	}
+	cmd.Dir = "/" // Run from root to avoid any working directory issues
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start background process: %w", err)
 	}
 
-	// Write PID file immediately so the user can find the process
+	// Write PID file
 	pid := cmd.Process.Pid
 	if err := WritePID(paths.PIDFile, pid); err != nil {
-		// Non-fatal: the process started, we just couldn't write the PID file
 		fmt.Fprintf(os.Stderr, "warning: could not write PID file: %v\n", err)
 	}
 
@@ -69,7 +63,6 @@ func ForkIntoBackground(opts BackgroundOpts) error {
 	fmt.Printf("  PID file: %s\n", paths.PIDFile)
 	fmt.Printf("  Stop with: %s stop\n", AppName)
 
-	// Parent exits, child continues independently
 	return nil
 }
 
