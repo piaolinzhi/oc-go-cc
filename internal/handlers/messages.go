@@ -229,10 +229,10 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 
 	if isStreaming {
 		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID)
+		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID, string(routeResult.Scenario))
 	} else {
 		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID)
+		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID, string(routeResult.Scenario))
 	}
 }
 
@@ -244,6 +244,7 @@ func (h *MessagesHandler) handleStreaming(
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
 	requestID string,
+	scenario string,
 ) {
 	// Each fallback attempt needs its own context with timeout.
 	// Don't share r.Context() across fallbacks - when Claude Code retries,
@@ -300,10 +301,16 @@ func (h *MessagesHandler) handleStreaming(
 		default:
 		}
 
+		apiFormat := "openai"
+		if isAnthropicEndpoint(model.Provider, model.ModelID) {
+			apiFormat = "anthropic"
+		}
 		h.logger.Info("attempting streaming model",
 			"request_id", requestID,
 			"model", model.ModelID,
 			"provider", model.Provider,
+			"scenario", scenario,
+			"api_format", apiFormat,
 		)
 
 		if h.logger.Enabled(context.Background(), slog.LevelDebug) {
@@ -350,12 +357,18 @@ func (h *MessagesHandler) handleStreaming(
 			
 			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID, model.Provider); err != nil {
 				cancel()
-				// Check if this was a client disconnect
 				if clientCtx.Err() == context.Canceled {
 					h.logger.Info("client disconnected during anthropic stream", "request_id", requestID)
 					return
 				}
-				h.logger.Warn("anthropic streaming failed", "request_id", requestID, "model", model.ModelID, "error", err)
+				h.logger.Warn("anthropic streaming failed, trying fallback",
+					"request_id", requestID,
+					"model", model.ModelID,
+					"provider", model.Provider,
+					"call_method", "anthropic_streaming",
+					"error", err,
+					"request_body", string(modelBody)[:min(len(modelBody), 10000)],
+				)
 				continue
 			}
 			cancel()
@@ -369,7 +382,15 @@ func (h *MessagesHandler) handleStreaming(
 		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
 		if err != nil {
 			cancel()
-			h.logger.Warn("request transform failed", "request_id", requestID, "model", model.ModelID, "error", err)
+			reqBody, _ := json.Marshal(anthropicReq)
+			h.logger.Warn("request transform failed, trying fallback",
+				"request_id", requestID,
+				"model", model.ModelID,
+				"provider", model.Provider,
+				"call_method", "openai_streaming",
+				"error", err,
+				"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+			)
 			continue
 		}
 
@@ -401,12 +422,19 @@ func (h *MessagesHandler) handleStreaming(
 		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq, h.config.APIKey, model.Provider)
 		if err != nil {
 			cancel()
-			// Check if this was a client disconnect (context canceled)
 			if clientCtx.Err() == context.Canceled {
 				h.logger.Info("client disconnected during upstream request", "request_id", requestID)
 				return
 			}
-			h.logger.Warn("streaming request failed", "request_id", requestID, "model", model.ModelID, "error", err)
+			reqBody, _ := json.Marshal(openaiReq)
+			h.logger.Warn("streaming request failed, trying fallback",
+				"request_id", requestID,
+				"model", model.ModelID,
+				"provider", model.Provider,
+				"call_method", "openai_streaming",
+				"error", err,
+				"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+			)
 			continue
 		}
 
@@ -414,7 +442,6 @@ func (h *MessagesHandler) handleStreaming(
 		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
 			_ = streamBody.Close()
 			cancel()
-			// Check if this was a client disconnect
 			if clientCtx.Err() == context.Canceled {
 				h.logger.Info("client disconnected during stream", "request_id", requestID)
 				return
@@ -423,7 +450,15 @@ func (h *MessagesHandler) handleStreaming(
 				h.logger.Info("client disconnected during stream (context canceled)", "request_id", requestID)
 				return
 			}
-			h.logger.Warn("stream proxy failed", "request_id", requestID, "model", model.ModelID, "error", err)
+			reqBody, _ := json.Marshal(openaiReq)
+			h.logger.Warn("stream proxy failed, trying fallback",
+				"request_id", requestID,
+				"model", model.ModelID,
+				"provider", model.Provider,
+				"call_method", "openai_streaming",
+				"error", err,
+				"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+			)
 			continue
 		}
 		_ = streamBody.Close()
@@ -554,6 +589,7 @@ func (h *MessagesHandler) handleNonStreaming(
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
 	requestID string,
+	scenario string,
 ) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -562,11 +598,20 @@ func (h *MessagesHandler) handleNonStreaming(
 		ctx,
 		modelChain,
 		func(ctx context.Context, model config.ModelConfig) ([]byte, error) {
-			// Check if this is an Anthropic-native model (MiniMax) or provider is configured for anthropic
+			apiFormat := "openai"
+			if isAnthropicEndpoint(model.Provider, model.ModelID) {
+				apiFormat = "anthropic"
+			}
+			h.logger.Info("attempting non-streaming model",
+				"request_id", requestID,
+				"model", model.ModelID,
+				"provider", model.Provider,
+				"scenario", scenario,
+				"api_format", apiFormat,
+			)
 			if isAnthropicEndpoint(model.Provider, model.ModelID) {
 				return h.executeAnthropicRequest(ctx, rawBody, model)
 			}
-			// Otherwise use OpenAI transformation
 			return h.executeOpenAIRequest(ctx, anthropicReq, model)
 		},
 	)
@@ -629,13 +674,26 @@ func (h *MessagesHandler) executeAnthropicRequest(
 	// Send raw Anthropic request to Anthropic endpoint
 	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, false, h.config.APIKey, model.Provider)
 	if err != nil {
+		h.logger.Warn("anthropic request failed, trying fallback",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"call_method", "anthropic_non_streaming",
+			"error", err,
+			"request_body", string(rawBody)[:min(len(rawBody), 10000)],
+		)
 		return nil, fmt.Errorf("anthropic request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Read the response (already in Anthropic format)
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		h.logger.Warn("anthropic response read failed, trying fallback",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"call_method", "anthropic_non_streaming",
+			"error", err,
+			"request_body", string(rawBody)[:min(len(rawBody), 10000)],
+		)
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
@@ -653,6 +711,14 @@ func (h *MessagesHandler) executeOpenAIRequest(
 	// Transform request to OpenAI format.
 	openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
 	if err != nil {
+		reqBody, _ := json.Marshal(anthropicReq)
+		h.logger.Warn("request transform failed, trying fallback",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"call_method", "openai_non_streaming",
+			"error", err,
+			"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+		)
 		return nil, fmt.Errorf("request transform failed: %w", err)
 	}
 
@@ -682,17 +748,43 @@ func (h *MessagesHandler) executeOpenAIRequest(
 	// Handle non-streaming.
 	resp, err := h.client.ChatCompletionNonStreaming(ctx, model.ModelID, openaiReq, h.config.APIKey, model.Provider)
 	if err != nil {
+		reqBody, _ := json.Marshal(openaiReq)
+		h.logger.Warn("chat completion failed, trying fallback",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"call_method", "openai_non_streaming",
+			"error", err,
+			"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+		)
 		return nil, fmt.Errorf("chat completion failed: %w", err)
 	}
 
-	// Transform response to Anthropic format.
 	anthropicResp, err := h.responseTransformer.TransformResponse(resp, model.ModelID)
 	if err != nil {
+		reqBody, _ := json.Marshal(openaiReq)
+		respBody, _ := json.Marshal(resp)
+		h.logger.Warn("response transform failed, trying fallback",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"call_method", "openai_non_streaming",
+			"error", err,
+			"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+			"response_body", string(respBody)[:min(len(respBody), 10000)],
+		)
 		return nil, fmt.Errorf("response transform failed: %w", err)
 	}
 
 	responseBody, err := json.Marshal(anthropicResp)
 	if err != nil {
+		reqBody, _ := json.Marshal(openaiReq)
+		h.logger.Warn("response marshal failed, trying fallback",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"call_method", "openai_non_streaming",
+			"error", err,
+			"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+			"anthropic_resp", fmt.Sprintf("%+v", anthropicResp),
+		)
 		return nil, fmt.Errorf("failed to marshal response: %w", err)
 	}
 

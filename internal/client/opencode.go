@@ -90,7 +90,7 @@ func (c *OpenCodeClient) getEndpoint(modelID string, providerName string) Endpoi
 		p, err = provider.Get(providerName)
 		if err == nil {
 			ep := p.EndpointConfig(modelID)
-			fmt.Printf("[DEBUG] Using provider %s, BaseURL: %s\n", providerName, ep.BaseURL)
+			fmt.Printf("[DEBUG] Using provider %s, BaseURL: %s, EndpointType: %s\n", providerName, ep.BaseURL, ep.EndpointType)
 			return EndpointConfig{
 				BaseURL:      ep.BaseURL,
 				APIKey:       ep.APIKey,
@@ -103,7 +103,7 @@ func (c *OpenCodeClient) getEndpoint(modelID string, providerName string) Endpoi
 	// Fall back to default provider
 	if c.defaultProvider != nil {
 		ep := c.defaultProvider.EndpointConfig(modelID)
-		fmt.Printf("[DEBUG] Using default provider, BaseURL: %s\n", ep.BaseURL)
+		fmt.Printf("[DEBUG] Using default provider, BaseURL: %s, EndpointType: %s\n", ep.BaseURL, ep.EndpointType)
 		return EndpointConfig{
 			BaseURL:      ep.BaseURL,
 			APIKey:       ep.APIKey,
