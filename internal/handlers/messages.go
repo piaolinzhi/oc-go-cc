@@ -15,6 +15,7 @@ import (
 	"oc-go-cc/internal/config"
 	"oc-go-cc/internal/metrics"
 	"oc-go-cc/internal/middleware"
+	"oc-go-cc/internal/provider"
 	"oc-go-cc/internal/router"
 	"oc-go-cc/internal/token"
 	"oc-go-cc/internal/transformer"
@@ -91,6 +92,20 @@ func NewMessagesHandler(
 	}
 }
 
+// isAnthropicEndpoint checks if we should use Anthropic format based on provider config or model ID.
+// Priority: 1. Provider's endpoint_type config 2. Model ID detection
+func isAnthropicEndpoint(providerName string, modelID string) bool {
+	if providerName != "" {
+		if p, err := provider.Get(providerName); err == nil {
+			endpointConfig := p.EndpointConfig(modelID)
+			if endpointConfig.EndpointType == "anthropic" {
+				return true
+			}
+		}
+	}
+	return client.IsAnthropicModel(modelID)
+}
+
 // HandleMessages handles POST /v1/messages.
 func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -146,12 +161,22 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	h.metrics.RecordRequest(isStreaming)
 
 	h.logger.Info("received request",
+		"request_id", requestID,
 		"model", anthropicReq.Model,
 		"streaming", isStreaming,
 		"messages", len(anthropicReq.Messages),
 		"tools", len(anthropicReq.Tools),
 		"max_tokens", anthropicReq.MaxTokens,
+		"temperature", anthropicReq.Temperature,
 	)
+
+	if h.logger.Enabled(context.Background(), slog.LevelDebug) {
+		reqBody, _ := json.Marshal(anthropicReq)
+		h.logger.Debug("request body",
+			"request_id", requestID,
+			"body", string(reqBody)[:min(len(reqBody), 10000)],
+		)
+	}
 
 	// Build message content for routing and token counting.
 	var routerMessages []router.MessageContent
@@ -204,10 +229,10 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 
 	if isStreaming {
 		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID)
 	} else {
 		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID)
 	}
 }
 
@@ -218,6 +243,7 @@ func (h *MessagesHandler) handleStreaming(
 	anthropicReq *types.MessageRequest,
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
+	requestID string,
 ) {
 	// Each fallback attempt needs its own context with timeout.
 	// Don't share r.Context() across fallbacks - when Claude Code retries,
@@ -274,31 +300,68 @@ func (h *MessagesHandler) handleStreaming(
 		default:
 		}
 
-		h.logger.Info("attempting streaming model", "model", model.ModelID)
+		h.logger.Info("attempting streaming model",
+			"request_id", requestID,
+			"model", model.ModelID,
+			"provider", model.Provider,
+		)
+
+		if h.logger.Enabled(context.Background(), slog.LevelDebug) {
+			h.logger.Debug("streaming model config",
+				"request_id", requestID,
+				"model", model.ModelID,
+				"provider", model.Provider,
+				"temperature", model.Temperature,
+				"max_tokens", model.MaxTokens,
+			)
+		}
 
 		// Create a fresh context with timeout for THIS attempt only.
 		// Don't use r.Context() directly - it gets canceled when Claude Code retries.
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 
-		// Check if this is an Anthropic-native model (MiniMax)
-		if client.IsAnthropicModel(model.ModelID) {
+		// Check if this is an Anthropic-native model (MiniMax) or provider is configured for anthropic
+		if isAnthropicEndpoint(model.Provider, model.ModelID) {
 			// For MiniMax models, send raw Anthropic request to Anthropic endpoint
 			// But we need to replace the model name in the raw body
 			modelBody := replaceModelInRawBody(rawBody, model.ModelID)
-			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID); err != nil {
+			
+			if h.logger.Enabled(context.Background(), slog.LevelDebug) {
+				// Get provider info for logging
+				prov, _ := provider.Get(model.Provider)
+				var baseURL string
+				var anthropicBaseURL string
+				if prov != nil {
+					pcfg := prov.Config()
+					baseURL = pcfg.BaseURL
+					anthropicBaseURL = pcfg.AnthropicBaseURL
+				}
+				
+				h.logger.Debug("sending upstream request",
+				"request_id", requestID,
+				"model", model.ModelID,
+				"provider", model.Provider,
+				"request_format", "anthropic",
+				"provider_base_url", baseURL,
+				"provider_anthropic_url", anthropicBaseURL,
+				"body", string(modelBody)[:min(len(modelBody), 10000)],
+			)
+			}
+			
+			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID, model.Provider); err != nil {
 				cancel()
 				// Check if this was a client disconnect
 				if clientCtx.Err() == context.Canceled {
-					h.logger.Info("client disconnected during anthropic stream")
+					h.logger.Info("client disconnected during anthropic stream", "request_id", requestID)
 					return
 				}
-				h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
+				h.logger.Warn("anthropic streaming failed", "request_id", requestID, "model", model.ModelID, "error", err)
 				continue
 			}
 			cancel()
 			latency := time.Since(streamStart)
 			h.metrics.RecordSuccess(model.ModelID, latency)
-			h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
+			h.logger.Info("streaming completed", "request_id", requestID, "model", model.ModelID, "latency", latency)
 			return
 		}
 
@@ -306,20 +369,44 @@ func (h *MessagesHandler) handleStreaming(
 		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
 		if err != nil {
 			cancel()
-			h.logger.Warn("request transform failed", "model", model.ModelID, "error", err)
+			h.logger.Warn("request transform failed", "request_id", requestID, "model", model.ModelID, "error", err)
 			continue
 		}
 
+		if h.logger.Enabled(context.Background(), slog.LevelDebug) {
+			reqBody, _ := json.Marshal(openaiReq)
+			
+			// Get provider info for logging
+			prov, _ := provider.Get(model.Provider)
+			var baseURL string
+			var anthropicBaseURL string
+			if prov != nil {
+				pcfg := prov.Config()
+				baseURL = pcfg.BaseURL
+				anthropicBaseURL = pcfg.AnthropicBaseURL
+			}
+			
+			h.logger.Debug("sending upstream request",
+				"request_id", requestID,
+				"model", model.ModelID,
+				"provider", model.Provider,
+				"request_format", "openai",
+				"provider_base_url", baseURL,
+				"provider_anthropic_url", anthropicBaseURL,
+				"body", string(reqBody)[:min(len(reqBody), 10000)],
+			)
+		}
+
 		// Get streaming body from upstream
-		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq)
+		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq, h.config.APIKey, model.Provider)
 		if err != nil {
 			cancel()
 			// Check if this was a client disconnect (context canceled)
 			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during upstream request")
+				h.logger.Info("client disconnected during upstream request", "request_id", requestID)
 				return
 			}
-			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
+			h.logger.Warn("streaming request failed", "request_id", requestID, "model", model.ModelID, "error", err)
 			continue
 		}
 
@@ -327,24 +414,23 @@ func (h *MessagesHandler) handleStreaming(
 		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
 			_ = streamBody.Close()
 			cancel()
-			if err == transformer.ErrClientDisconnected {
-				h.logger.Info("client disconnected during stream")
-				return
-			}
 			// Check if this was a client disconnect
 			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during stream (context canceled)")
+				h.logger.Info("client disconnected during stream", "request_id", requestID)
 				return
 			}
-			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", err)
+			if err == context.Canceled {
+				h.logger.Info("client disconnected during stream (context canceled)", "request_id", requestID)
+				return
+			}
+			h.logger.Warn("stream proxy failed", "request_id", requestID, "model", model.ModelID, "error", err)
 			continue
 		}
-
 		_ = streamBody.Close()
 		cancel()
 		latency := time.Since(streamStart)
 		h.metrics.RecordSuccess(model.ModelID, latency)
-		h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
+		h.logger.Info("streaming completed", "request_id", requestID, "model", model.ModelID, "latency", latency)
 		return
 	}
 
@@ -392,15 +478,33 @@ func (h *MessagesHandler) handleAnthropicStreaming(
 	w http.ResponseWriter,
 	rawBody json.RawMessage,
 	modelID string,
+	providerName string,
 ) error {
-	// Debug: Log what we're sending
-	h.logger.Debug("sending anthropic streaming request",
+	// Debug: Log what we're sending - include full tools section for debugging
+	bodyStr := string(rawBody)
+	h.logger.Debug("sending upstream request",
 		"model_id", modelID,
-		"body_preview", string(rawBody)[:min(len(rawBody), 200)])
+		"provider", providerName,
+		"request_format", "anthropic",
+		"body_length", len(bodyStr),
+		"body", bodyStr[:min(len(bodyStr), 10000)])
+	
+	// Log tools section specifically if present
+	if idx := strings.Index(bodyStr, `"tools":`); idx != -1 {
+		endIdx := strings.Index(bodyStr[idx:], `],"`)
+		if endIdx == -1 {
+			endIdx = strings.Index(bodyStr[idx:], `]}`)
+		}
+		if endIdx != -1 {
+			toolsSection := bodyStr[idx : idx+endIdx+2]
+			h.logger.Debug("anthropic request tools section",
+				"tools", toolsSection)
+		}
+	}
 
 	// Send raw Anthropic request to Anthropic endpoint
 	// Use ctx so cancellation propagates when client disconnects
-	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, true)
+	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, true, h.config.APIKey, providerName)
 	if err != nil {
 		return err
 	}
@@ -449,6 +553,7 @@ func (h *MessagesHandler) handleNonStreaming(
 	anthropicReq *types.MessageRequest,
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
+	requestID string,
 ) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -457,8 +562,8 @@ func (h *MessagesHandler) handleNonStreaming(
 		ctx,
 		modelChain,
 		func(ctx context.Context, model config.ModelConfig) ([]byte, error) {
-			// Check if this is an Anthropic-native model (MiniMax)
-			if client.IsAnthropicModel(model.ModelID) {
+			// Check if this is an Anthropic-native model (MiniMax) or provider is configured for anthropic
+			if isAnthropicEndpoint(model.Provider, model.ModelID) {
 				return h.executeAnthropicRequest(ctx, rawBody, model)
 			}
 			// Otherwise use OpenAI transformation
@@ -476,10 +581,18 @@ func (h *MessagesHandler) handleNonStreaming(
 	h.metrics.RecordSuccess(result.ModelID, latency)
 
 	h.logger.Info("request completed",
+		"request_id", requestID,
 		"model", result.ModelID,
 		"attempts", result.Attempted,
 		"latency", latency,
 	)
+
+	if h.logger.Enabled(context.Background(), slog.LevelDebug) {
+		h.logger.Debug("response body",
+			"request_id", requestID,
+			"body", string(responseBody)[:min(len(responseBody), 10000)],
+		)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -492,8 +605,29 @@ func (h *MessagesHandler) executeAnthropicRequest(
 	rawBody json.RawMessage,
 	model config.ModelConfig,
 ) ([]byte, error) {
+	if h.logger.Enabled(context.Background(), slog.LevelDebug) {
+		// Get provider info for logging
+		prov, _ := provider.Get(model.Provider)
+		var baseURL string
+		var anthropicBaseURL string
+		if prov != nil {
+			pcfg := prov.Config()
+			baseURL = pcfg.BaseURL
+			anthropicBaseURL = pcfg.AnthropicBaseURL
+		}
+		
+		h.logger.Debug("sending upstream request",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"request_format", "anthropic",
+			"provider_base_url", baseURL,
+			"provider_anthropic_url", anthropicBaseURL,
+			"body", string(rawBody)[:min(len(rawBody), 10000)],
+		)
+	}
+	
 	// Send raw Anthropic request to Anthropic endpoint
-	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, false)
+	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, false, h.config.APIKey, model.Provider)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic request failed: %w", err)
 	}
@@ -522,8 +656,31 @@ func (h *MessagesHandler) executeOpenAIRequest(
 		return nil, fmt.Errorf("request transform failed: %w", err)
 	}
 
+	if h.logger.Enabled(context.Background(), slog.LevelDebug) {
+		reqBody, _ := json.Marshal(openaiReq)
+		
+		// Get provider info for logging
+		prov, _ := provider.Get(model.Provider)
+		var baseURL string
+		var anthropicBaseURL string
+		if prov != nil {
+			pcfg := prov.Config()
+			baseURL = pcfg.BaseURL
+			anthropicBaseURL = pcfg.AnthropicBaseURL
+		}
+		
+		h.logger.Debug("sending upstream request",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"request_format", "openai",
+			"provider_base_url", baseURL,
+			"provider_anthropic_url", anthropicBaseURL,
+			"body", string(reqBody)[:min(len(reqBody), 10000)],
+		)
+	}
+
 	// Handle non-streaming.
-	resp, err := h.client.ChatCompletionNonStreaming(ctx, model.ModelID, openaiReq)
+	resp, err := h.client.ChatCompletionNonStreaming(ctx, model.ModelID, openaiReq, h.config.APIKey, model.Provider)
 	if err != nil {
 		return nil, fmt.Errorf("chat completion failed: %w", err)
 	}
@@ -534,7 +691,20 @@ func (h *MessagesHandler) executeOpenAIRequest(
 		return nil, fmt.Errorf("response transform failed: %w", err)
 	}
 
-	return json.Marshal(anthropicResp)
+	responseBody, err := json.Marshal(anthropicResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal response: %w", err)
+	}
+
+	if h.logger.Enabled(context.Background(), slog.LevelDebug) {
+		h.logger.Debug("openai response transformed",
+			"model", model.ModelID,
+			"provider", model.Provider,
+			"body", string(responseBody)[:min(len(responseBody), 10000)],
+		)
+	}
+
+	return responseBody, nil
 }
 
 // extractTextFromBlocks extracts plain text from Anthropic content blocks.

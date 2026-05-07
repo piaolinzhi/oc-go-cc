@@ -15,6 +15,7 @@ import (
 	"oc-go-cc/internal/config"
 	"oc-go-cc/internal/handlers"
 	"oc-go-cc/internal/metrics"
+	"oc-go-cc/internal/provider"
 	"oc-go-cc/internal/router"
 	"oc-go-cc/internal/token"
 )
@@ -42,7 +43,48 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// Create metrics
 	metrics := metrics.New()
 
-	openCodeClient := client.NewOpenCodeClient(cfg.OpenCodeGo, cfg.APIKey)
+	// Initialize providers
+	logger.Info("Loading providers from config...")
+	logger.Info("Number of providers in config", "count", len(cfg.Providers))
+	
+	for name, providerConfig := range cfg.Providers {
+		logger.Info("Found provider in config", "name", name, "base_url", providerConfig.BaseURL)
+		p := provider.NewDefaultProvider(name, providerConfig)
+		if err := provider.Register(p); err != nil {
+			return nil, fmt.Errorf("failed to register provider %q: %w", name, err)
+		}
+		logger.Info("registered provider", "name", name)
+	}
+
+	// Log all registered providers with their configuration
+	providersList := provider.List()
+	logger.Info("=== Registered Providers ===")
+	for _, p := range providersList {
+		cfg := p.Config()
+		apiKeySet := "not set"
+		if cfg.APIKey != "" {
+			apiKeySet = "set"
+		}
+		logger.Info("provider",
+			"name", p.Name(),
+			"base_url", cfg.BaseURL,
+			"anthropic_base_url", cfg.AnthropicBaseURL,
+			"api_key", apiKeySet,
+			"endpoint_type", cfg.EndpointType,
+			"timeout_ms", cfg.TimeoutMs,
+		)
+	}
+	logger.Info("=== End Providers ===")
+
+	// Create client with default provider for backward compatibility
+	var openCodeClient *client.OpenCodeClient
+	providerList := provider.List()
+	if len(providerList) > 0 {
+		openCodeClient = client.NewOpenCodeClientWithProvider(providerList[0])
+	} else {
+		openCodeClient = client.NewOpenCodeClient(cfg.OpenCodeGo, cfg.APIKey)
+	}
+
 	modelRouter := router.NewModelRouter(cfg)
 	fallbackHandler := router.NewFallbackHandler(logger, 3, 30*time.Second)
 

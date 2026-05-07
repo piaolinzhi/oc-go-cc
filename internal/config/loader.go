@@ -18,10 +18,11 @@ const (
 	defaultAnthropicBaseURL = "https://opencode.ai/zen/go/v1/messages"
 	defaultTimeoutMs        = 300000
 	defaultLogLevel         = "info"
+	defaultProviderName     = "opencode-go"
 )
 
-// envVarPattern matches ${ENV_VAR} placeholders in config values.
-var envVarPattern = regexp.MustCompile(`\$\{([A-Za-z0-9_]+)\}`)
+// envVarPattern matches ${ENV_VAR} and $ENV_VAR placeholders in config values.
+var envVarPattern = regexp.MustCompile(`\$\{?([A-Za-z0-9_]+)\}?`)
 
 // Load reads configuration from a JSON file and applies environment variable overrides.
 // Config path resolution:
@@ -29,6 +30,8 @@ var envVarPattern = regexp.MustCompile(`\$\{([A-Za-z0-9_]+)\}`)
 //  2. ~/.config/oc-go-cc/config.json (default)
 func Load() (*Config, error) {
 	configPath := resolveConfigPath()
+	
+	fmt.Printf("[CONFIG] Loading configuration from: %s\n", configPath)
 
 	cfg, err := loadJSON(configPath)
 	if err != nil {
@@ -136,6 +139,24 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = defaultLogLevel
+	}
+
+	// 向后兼容：如果没有配置 providers，自动将 opencode_go 转换为 provider
+	if cfg.Providers == nil || len(cfg.Providers) == 0 {
+		cfg.Providers = map[string]ProviderConfig{
+			defaultProviderName: {
+				Name:             defaultProviderName,
+				BaseURL:          cfg.OpenCodeGo.BaseURL,
+				AnthropicBaseURL: cfg.OpenCodeGo.AnthropicBaseURL,
+				TimeoutMs:        cfg.OpenCodeGo.TimeoutMs,
+			},
+		}
+	}
+
+	// 解析 provider 配置中的环境变量
+	for name, provider := range cfg.Providers {
+		provider.APIKey = interpolateEnvVars(provider.APIKey)
+		cfg.Providers[name] = provider
 	}
 }
 

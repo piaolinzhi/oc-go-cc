@@ -11,20 +11,21 @@ import (
 	"time"
 
 	"oc-go-cc/internal/config"
+	"oc-go-cc/internal/provider"
 	"oc-go-cc/pkg/types"
 )
 
 // OpenCodeClient handles communication with OpenCode Go API.
 type OpenCodeClient struct {
-	openAIConfig    EndpointConfig
-	anthropicConfig EndpointConfig
+	defaultProvider provider.Provider
 	httpClient      *http.Client
 }
 
 // EndpointConfig holds configuration for a specific API endpoint.
 type EndpointConfig struct {
-	BaseURL string
-	APIKey  string
+	BaseURL      string
+	APIKey       string
+	EndpointType string
 }
 
 // NewOpenCodeClient creates a new OpenCode Go client.
@@ -34,7 +35,25 @@ func NewOpenCodeClient(cfg config.OpenCodeGoConfig, apiKey string) *OpenCodeClie
 		timeout = 5 * time.Minute
 	}
 
-	// Configure connection pooling for better performance
+	return &OpenCodeClient{
+		httpClient: createHTTPClient(timeout),
+	}
+}
+
+// NewOpenCodeClientWithProvider creates a new OpenCode Go client with a specific provider.
+func NewOpenCodeClientWithProvider(p provider.Provider) *OpenCodeClient {
+	timeout := time.Duration(p.Config().TimeoutMs) * time.Millisecond
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
+
+	return &OpenCodeClient{
+		defaultProvider: p,
+		httpClient:      createHTTPClient(timeout),
+	}
+}
+
+func createHTTPClient(timeout time.Duration) *http.Client {
 	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
@@ -43,19 +62,9 @@ func NewOpenCodeClient(cfg config.OpenCodeGoConfig, apiKey string) *OpenCodeClie
 		DisableKeepAlives:   false,
 	}
 
-	return &OpenCodeClient{
-		openAIConfig: EndpointConfig{
-			BaseURL: cfg.BaseURL,
-			APIKey:  apiKey,
-		},
-		anthropicConfig: EndpointConfig{
-			BaseURL: cfg.AnthropicBaseURL,
-			APIKey:  apiKey,
-		},
-		httpClient: &http.Client{
-			Timeout:   timeout,
-			Transport: transport,
-		},
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
 	}
 }
 
@@ -69,12 +78,44 @@ func IsAnthropicModel(modelID string) bool {
 	}
 }
 
-// getEndpoint returns the appropriate endpoint config for a model.
-func (c *OpenCodeClient) getEndpoint(modelID string) EndpointConfig {
-	if IsAnthropicModel(modelID) {
-		return c.anthropicConfig
+// getEndpoint returns the appropriate endpoint config for a model and provider.
+func (c *OpenCodeClient) getEndpoint(modelID string, providerName string) EndpointConfig {
+	var p provider.Provider
+	var err error
+
+	fmt.Printf("[DEBUG] getEndpoint called - modelID: %s, providerName: %s\n", modelID, providerName)
+
+	// Try to get provider by name if specified
+	if providerName != "" {
+		p, err = provider.Get(providerName)
+		if err == nil {
+			ep := p.EndpointConfig(modelID)
+			fmt.Printf("[DEBUG] Using provider %s, BaseURL: %s\n", providerName, ep.BaseURL)
+			return EndpointConfig{
+				BaseURL:      ep.BaseURL,
+				APIKey:       ep.APIKey,
+				EndpointType: ep.EndpointType,
+			}
+		}
+		fmt.Printf("[DEBUG] Provider %s not found, error: %v\n", providerName, err)
 	}
-	return c.openAIConfig
+
+	// Fall back to default provider
+	if c.defaultProvider != nil {
+		ep := c.defaultProvider.EndpointConfig(modelID)
+		fmt.Printf("[DEBUG] Using default provider, BaseURL: %s\n", ep.BaseURL)
+		return EndpointConfig{
+			BaseURL:      ep.BaseURL,
+			APIKey:       ep.APIKey,
+			EndpointType: ep.EndpointType,
+		}
+	}
+
+	// Default behavior based on model type
+	if IsAnthropicModel(modelID) {
+		return EndpointConfig{EndpointType: "anthropic"}
+	}
+	return EndpointConfig{EndpointType: "openai"}
 }
 
 // ChatCompletion sends a chat completion request to the OpenCode Go API.
@@ -83,8 +124,14 @@ func (c *OpenCodeClient) ChatCompletion(
 	ctx context.Context,
 	modelID string,
 	req *types.ChatCompletionRequest,
+	apiKey string,
+	providerName string,
 ) (*http.Response, error) {
-	endpoint := c.getEndpoint(modelID)
+	endpoint := c.getEndpoint(modelID, providerName)
+	
+	if endpoint.BaseURL == "" {
+		return nil, fmt.Errorf("no base URL configured for model %s", modelID)
+	}
 
 	body, err := json.Marshal(req)
 	if err != nil {
@@ -98,7 +145,13 @@ func (c *OpenCodeClient) ChatCompletion(
 
 	// Set headers
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+endpoint.APIKey)
+	
+	// Use provider API key if available, otherwise fallback to global API key
+	key := endpoint.APIKey
+	if key == "" {
+		key = apiKey
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+key)
 
 	// Add streaming header if requested
 	if req.Stream != nil && *req.Stream {
@@ -125,12 +178,14 @@ func (c *OpenCodeClient) ChatCompletionNonStreaming(
 	ctx context.Context,
 	modelID string,
 	req *types.ChatCompletionRequest,
+	apiKey string,
+	providerName string,
 ) (*types.ChatCompletionResponse, error) {
 	// Force non-streaming
 	streamFalse := false
 	req.Stream = &streamFalse
 
-	resp, err := c.ChatCompletion(ctx, modelID, req)
+	resp, err := c.ChatCompletion(ctx, modelID, req, apiKey, providerName)
 	if err != nil {
 		return nil, err
 	}
@@ -155,12 +210,14 @@ func (c *OpenCodeClient) GetStreamingBody(
 	ctx context.Context,
 	modelID string,
 	req *types.ChatCompletionRequest,
+	apiKey string,
+	providerName string,
 ) (io.ReadCloser, error) {
 	// Force streaming
 	streamTrue := true
 	req.Stream = &streamTrue
 
-	resp, err := c.ChatCompletion(ctx, modelID, req)
+	resp, err := c.ChatCompletion(ctx, modelID, req, apiKey, providerName)
 	if err != nil {
 		return nil, err
 	}
@@ -174,8 +231,23 @@ func (c *OpenCodeClient) SendAnthropicRequest(
 	ctx context.Context,
 	body []byte,
 	stream bool,
+	apiKey string,
+	providerName string,
 ) (*http.Response, error) {
-	endpoint := c.anthropicConfig
+	// Extract model from body to get correct endpoint config
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, fmt.Errorf("failed to parse request body for model extraction: %w", err)
+	}
+	fmt.Printf("[DEBUG] SendAnthropicRequest - extracted model: %s, provider: %s\n", req.Model, providerName)
+	
+	endpoint := c.getEndpoint(req.Model, providerName)
+	
+	if endpoint.BaseURL == "" {
+		return nil, fmt.Errorf("no base URL configured for anthropic endpoint")
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.BaseURL, bytes.NewReader(body))
 	if err != nil {
@@ -184,9 +256,14 @@ func (c *OpenCodeClient) SendAnthropicRequest(
 
 	// Set headers
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+endpoint.APIKey)
-	// Incase OpenCode Go expects x-api-key instead
-	httpReq.Header.Set("x-api-key", endpoint.APIKey)
+	
+	// Use provider API key if available, otherwise fallback to global API key
+	key := endpoint.APIKey
+	if key == "" {
+		key = apiKey
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+key)
+	httpReq.Header.Set("x-api-key", key)
 
 	// Add streaming header if requested
 	if stream {
