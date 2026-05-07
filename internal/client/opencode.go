@@ -18,7 +18,8 @@ import (
 // OpenCodeClient handles communication with OpenCode Go API.
 type OpenCodeClient struct {
 	defaultProvider provider.Provider
-	httpClient      *http.Client
+	atomic           *config.AtomicConfig
+	httpClient       *http.Client
 }
 
 // EndpointConfig holds configuration for a specific API endpoint.
@@ -29,13 +30,15 @@ type EndpointConfig struct {
 }
 
 // NewOpenCodeClient creates a new OpenCode Go client.
-func NewOpenCodeClient(cfg config.OpenCodeGoConfig, apiKey string) *OpenCodeClient {
-	timeout := time.Duration(cfg.TimeoutMs) * time.Millisecond
+func NewOpenCodeClient(atomic *config.AtomicConfig) *OpenCodeClient {
+	cfg := atomic.Get()
+	timeout := time.Duration(cfg.OpenCodeGo.TimeoutMs) * time.Millisecond
 	if timeout == 0 {
 		timeout = 5 * time.Minute
 	}
 
 	return &OpenCodeClient{
+		atomic:    atomic,
 		httpClient: createHTTPClient(timeout),
 	}
 }

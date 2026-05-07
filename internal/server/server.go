@@ -22,15 +22,20 @@ import (
 
 // Server represents the proxy server.
 type Server struct {
-	config  *config.Config
-	httpSrv *http.Server
-	logger  *slog.Logger
+	atomic   *config.AtomicConfig
+	httpSrv  *http.Server
+	logger   *slog.Logger
+	levelVar *slog.LevelVar
 }
 
 // NewServer creates a new proxy server.
-func NewServer(cfg *config.Config) (*Server, error) {
+func NewServer(atomic *config.AtomicConfig) (*Server, error) {
+	cfg := atomic.Get()
+	levelVar := new(slog.LevelVar)
+	levelVar.Set(parseLogLevel(cfg.Logging.Level))
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: parseLogLevel(cfg.Logging.Level),
+		Level: levelVar,
 	}))
 	slog.SetDefault(logger)
 
@@ -82,15 +87,14 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	if len(providerList) > 0 {
 		openCodeClient = client.NewOpenCodeClientWithProvider(providerList[0])
 	} else {
-		openCodeClient = client.NewOpenCodeClient(cfg.OpenCodeGo, cfg.APIKey)
+		openCodeClient = client.NewOpenCodeClient(atomic)
 	}
 
-	modelRouter := router.NewModelRouter(cfg)
+	modelRouter := router.NewModelRouter(atomic)
 	fallbackHandler := router.NewFallbackHandler(logger, 3, 30*time.Second)
 
 	// Create handlers.
 	messagesHandler := handlers.NewMessagesHandler(
-		cfg,
 		openCodeClient,
 		modelRouter,
 		fallbackHandler,
@@ -117,19 +121,29 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	return &Server{
-		config:  cfg,
-		httpSrv: httpSrv,
-		logger:  logger,
-	}, nil
+	srv := &Server{
+		atomic:   atomic,
+		httpSrv:  httpSrv,
+		logger:   logger,
+		levelVar: levelVar,
+	}
+
+	// Register callback to update log level on config reload
+	atomic.OnReload(func(newCfg *config.Config) {
+		levelVar.Set(parseLogLevel(newCfg.Logging.Level))
+		logger.Info("log level updated", "level", newCfg.Logging.Level)
+	})
+
+	return srv, nil
 }
 
 // Start starts the server with graceful shutdown.
 func (s *Server) Start() error {
+	cfg := s.atomic.Get()
 	s.logger.Info("starting oc-go-cc proxy",
-		"host", s.config.Host,
-		"port", s.config.Port,
-		"base_url", s.config.OpenCodeGo.BaseURL,
+		"host", cfg.Host,
+		"port", cfg.Port,
+		"base_url", cfg.OpenCodeGo.BaseURL,
 	)
 
 	// Graceful shutdown.

@@ -24,7 +24,6 @@ import (
 
 // MessagesHandler handles /v1/messages requests.
 type MessagesHandler struct {
-	config              *config.Config
 	client              *client.OpenCodeClient
 	modelRouter         *router.ModelRouter
 	fallbackHandler     *router.FallbackHandler
@@ -68,7 +67,6 @@ func (w *responseWriter) Flush() {
 
 // NewMessagesHandler creates a new messages handler.
 func NewMessagesHandler(
-	cfg *config.Config,
 	openCodeClient *client.OpenCodeClient,
 	modelRouter *router.ModelRouter,
 	fallbackHandler *router.FallbackHandler,
@@ -76,7 +74,6 @@ func NewMessagesHandler(
 	metrics *metrics.Metrics,
 ) *MessagesHandler {
 	return &MessagesHandler{
-		config:              cfg,
 		client:              openCodeClient,
 		modelRouter:         modelRouter,
 		fallbackHandler:     fallbackHandler,
@@ -205,9 +202,9 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Route to appropriate model.
-	// For streaming, use faster models to minimize TTFT (time-to-first-token)
 	var routeResult router.RouteResult
-	if isStreaming {
+	if isStreaming && !h.modelRouter.IsStreamingScenarioRoutingEnabled() {
+		// Streaming: use faster models to minimize TTFT (time-to-first-token)
 		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
 	} else {
 		var err error
@@ -259,7 +256,7 @@ func (h *MessagesHandler) handleStreaming(
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
+	rw.WriteHeader(http.StatusOK)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -276,7 +273,7 @@ func (h *MessagesHandler) handleStreaming(
 			select {
 			case <-ticker.C:
 				// Send SSE comment (ignored by client but keeps connection alive)
-				_, _ = fmt.Fprintf(w, ":keepalive\n\n")
+				_, _ = fmt.Fprintf(rw, ":keepalive\n\n")
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}
@@ -419,7 +416,7 @@ func (h *MessagesHandler) handleStreaming(
 		}
 
 		// Get streaming body from upstream
-		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq, h.config.APIKey, model.Provider)
+		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq, "", model.Provider)
 		if err != nil {
 			cancel()
 			if clientCtx.Err() == context.Canceled {
@@ -539,7 +536,7 @@ func (h *MessagesHandler) handleAnthropicStreaming(
 
 	// Send raw Anthropic request to Anthropic endpoint
 	// Use ctx so cancellation propagates when client disconnects
-	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, true, h.config.APIKey, providerName)
+	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, true, "", providerName)
 	if err != nil {
 		return err
 	}
@@ -672,7 +669,7 @@ func (h *MessagesHandler) executeAnthropicRequest(
 	}
 	
 	// Send raw Anthropic request to Anthropic endpoint
-	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, false, h.config.APIKey, model.Provider)
+	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, false, "", model.Provider)
 	if err != nil {
 		h.logger.Warn("anthropic request failed, trying fallback",
 			"model", model.ModelID,
@@ -746,7 +743,7 @@ func (h *MessagesHandler) executeOpenAIRequest(
 	}
 
 	// Handle non-streaming.
-	resp, err := h.client.ChatCompletionNonStreaming(ctx, model.ModelID, openaiReq, h.config.APIKey, model.Provider)
+	resp, err := h.client.ChatCompletionNonStreaming(ctx, model.ModelID, openaiReq, "", model.Provider)
 	if err != nil {
 		reqBody, _ := json.Marshal(openaiReq)
 		h.logger.Warn("chat completion failed, trying fallback",

@@ -8,6 +8,8 @@ type Config struct {
 	APIKey         string                   `json:"api_key"`
 	Host           string                   `json:"host"`
 	Port           int                      `json:"port"`
+	HotReload                      bool                     `json:"hot_reload"`
+	EnableStreamingScenarioRouting bool                     `json:"enable_streaming_scenario_routing"`
 	Models         map[string]ModelConfig   `json:"models"`
 	Fallbacks      map[string][]ModelConfig `json:"fallbacks"`
 	Providers      map[string]ProviderConfig `json:"providers,omitempty"`
