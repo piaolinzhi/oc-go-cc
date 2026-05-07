@@ -48,7 +48,7 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		return ScenarioResult{
 			Scenario:   ScenarioLongContext,
 			TokenCount: tokenCount,
-			Reason:     fmt.Sprintf("token count %d exceeds threshold %d (use MiniMax for 1M context)", tokenCount, threshold),
+			Reason:     fmt.Sprintf("token count %d exceeds threshold %d (Recommand MiniMax for 1M context)", tokenCount, threshold),
 		}
 	}
 
@@ -57,7 +57,7 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		return ScenarioResult{
 			Scenario:   ScenarioComplex,
 			TokenCount: tokenCount,
-			Reason:     "complex or tool-based operation detected (use GLM-5.1)",
+			Reason:     "complex or tool-based operation detected (Recommand GLM-5.1)",
 		}
 	}
 
@@ -66,7 +66,7 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		return ScenarioResult{
 			Scenario:   ScenarioThink,
 			TokenCount: tokenCount,
-			Reason:     "thinking/reasoning pattern detected (use GLM-5)",
+			Reason:     "thinking/reasoning pattern detected (Recommand GLM-5)",
 		}
 	}
 
@@ -75,7 +75,7 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		return ScenarioResult{
 			Scenario:   ScenarioBackground,
 			TokenCount: tokenCount,
-			Reason:     "simple background task detected (use Qwen3.5 Plus)",
+			Reason:     "simple background task detected (Recommand Qwen3.5 Plus)",
 		}
 	}
 
@@ -83,7 +83,7 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 	return ScenarioResult{
 		Scenario:   ScenarioDefault,
 		TokenCount: tokenCount,
-		Reason:     "default scenario (use Kimi K2.6)",
+		Reason:     "default scenario (Recommand Kimi K2.6)",
 	}
 }
 
