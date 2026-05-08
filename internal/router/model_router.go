@@ -23,12 +23,13 @@ type RouteResult struct {
 	Primary   config.ModelConfig
 	Fallbacks []config.ModelConfig
 	Scenario  Scenario
+	Reason    string
 }
 
 // Route determines which model to use for a request.
-func (r *ModelRouter) Route(messages []MessageContent, tokenCount int) (RouteResult, error) {
+func (r *ModelRouter) Route(messages []MessageContent, tokenCount int, modelID string) (RouteResult, error) {
 	cfg := r.atomic.Get()
-	result := DetectScenario(messages, tokenCount, cfg)
+	result := DetectScenario(messages, tokenCount, cfg, modelID)
 
 	// Get primary model for scenario
 	primary, ok := cfg.Models[string(result.Scenario)]
@@ -51,6 +52,7 @@ func (r *ModelRouter) Route(messages []MessageContent, tokenCount int) (RouteRes
 		Primary:   primary,
 		Fallbacks: fallbacks,
 		Scenario:  result.Scenario,
+		Reason:    result.Reason,
 	}, nil
 }
 
@@ -95,5 +97,6 @@ func (r *ModelRouter) RouteForStreaming(messages []MessageContent, tokenCount in
 		Primary:   primary,
 		Fallbacks: fallbacks,
 		Scenario:  result.Scenario,
+		Reason:    result.Reason,
 	}
 }

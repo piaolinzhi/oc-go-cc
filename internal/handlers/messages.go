@@ -171,7 +171,7 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		reqBody, _ := json.Marshal(anthropicReq)
 		h.logger.Debug("request body",
 			"request_id", requestID,
-			"body", string(reqBody)[:min(len(reqBody), 10000)],
+			"body", string(reqBody),
 		)
 	}
 
@@ -208,7 +208,7 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
 	} else {
 		var err error
-		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount)
+		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount, anthropicReq.Model)
 		if err != nil {
 			h.sendError(w, http.StatusInternalServerError, "routing failed", err)
 			return
@@ -226,10 +226,10 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 
 	if isStreaming {
 		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID, string(routeResult.Scenario))
+		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID, string(routeResult.Scenario), routeResult.Reason)
 	} else {
 		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID, string(routeResult.Scenario))
+		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, requestID, string(routeResult.Scenario), routeResult.Reason)
 	}
 }
 
@@ -242,6 +242,7 @@ func (h *MessagesHandler) handleStreaming(
 	rawBody json.RawMessage,
 	requestID string,
 	scenario string,
+	scenarioReason string,
 ) {
 	// Each fallback attempt needs its own context with timeout.
 	// Don't share r.Context() across fallbacks - when Claude Code retries,
@@ -307,6 +308,7 @@ func (h *MessagesHandler) handleStreaming(
 			"model", model.ModelID,
 			"provider", model.Provider,
 			"scenario", scenario,
+			"scenario_reason", scenarioReason,
 			"api_format", apiFormat,
 		)
 
@@ -587,6 +589,7 @@ func (h *MessagesHandler) handleNonStreaming(
 	rawBody json.RawMessage,
 	requestID string,
 	scenario string,
+	scenarioReason string,
 ) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -604,6 +607,7 @@ func (h *MessagesHandler) handleNonStreaming(
 				"model", model.ModelID,
 				"provider", model.Provider,
 				"scenario", scenario,
+				"scenario_reason", scenarioReason,
 				"api_format", apiFormat,
 			)
 			if isAnthropicEndpoint(model.Provider, model.ModelID) {

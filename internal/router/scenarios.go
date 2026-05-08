@@ -34,15 +34,16 @@ type MessageContent struct {
 
 // DetectScenario analyzes a request to determine which model to use.
 // Routing priority:
-//  1. Long Context (> threshold)
-//  2. Complex (architectural patterns or tool-heavy operations)
-//  3. Think (reasoning patterns)
-//  4. Background (simple operations with NO tools)
-//  5. Default
+//  1. Long Context (> threshold) - 硬性限制，最先判断
+//  2. Model Tier (sonnet -> think, haiku -> fast)
+//  3. Complex (architectural patterns or tool-heavy operations)
+//  4. Think (reasoning patterns)
+//  5. Background (simple operations with NO tools)
+//  6. Default
 //
 // For streaming requests, consider using RouteForStreaming() to prefer faster models.
-func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Config) ScenarioResult {
-	// 1. Check for long context first (most important)
+func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Config, modelID string) ScenarioResult {
+	// 1. Check for long context first (most important - hard constraint)
 	threshold := getLongContextThreshold(cfg)
 	if tokenCount > threshold {
 		return ScenarioResult{
@@ -52,7 +53,25 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		}
 	}
 
-	// 2. Check for complex tasks (architectural OR tool-related)
+	// 2. Check model tier (sonnet -> think, haiku -> fast)
+	if tier := getModelTier(modelID); tier != "" {
+		switch tier {
+		case "sonnet":
+			return ScenarioResult{
+				Scenario:   ScenarioThink,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("model tier sonnet -> think scenario (model: %s)", modelID),
+			}
+		case "haiku":
+			return ScenarioResult{
+				Scenario:   ScenarioFast,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("model tier haiku -> fast scenario (model: %s)", modelID),
+			}
+		}
+	}
+
+	// 3. Check for complex tasks (architectural OR tool-related)
 	if hasComplexPattern(messages) {
 		return ScenarioResult{
 			Scenario:   ScenarioComplex,
@@ -61,7 +80,7 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		}
 	}
 
-	// 3. Check for thinking/reasoning patterns
+	// 4. Check for thinking/reasoning patterns
 	if hasThinkingPattern(messages) {
 		return ScenarioResult{
 			Scenario:   ScenarioThink,
@@ -70,7 +89,7 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		}
 	}
 
-	// 4. Check for background task patterns (truly simple operations)
+	// 5. Check for background task patterns (truly simple operations)
 	if hasBackgroundPattern(messages) {
 		return ScenarioResult{
 			Scenario:   ScenarioBackground,
@@ -79,7 +98,7 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		}
 	}
 
-	// 5. Default
+	// 6. Default
 	return ScenarioResult{
 		Scenario:   ScenarioDefault,
 		TokenCount: tokenCount,
@@ -189,6 +208,20 @@ func getLongContextThreshold(cfg *config.Config) int {
 		return lc.ContextThreshold
 	}
 	return 100000 // Default: 100K tokens
+}
+
+// getModelTier extracts the model tier from a model ID.
+// Model ID format: claude-{tier}-{version}, e.g., claude-sonnet-5-7, claude-haiku-4-7
+// Returns: "sonnet", "haiku", "opus", or "" if unknown
+func getModelTier(modelID string) string {
+	modelID = strings.ToLower(modelID)
+	if strings.Contains(modelID, "sonnet") {
+		return "sonnet"
+	}
+	if strings.Contains(modelID, "haiku") {
+		return "haiku"
+	}
+	return ""
 }
 
 // RouteForStreaming selects a model optimized for streaming latency.
