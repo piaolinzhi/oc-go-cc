@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -30,7 +31,7 @@ var envVarPattern = regexp.MustCompile(`\$\{?([A-Za-z0-9_]+)\}?`)
 //  2. ~/.config/oc-go-cc/config.json (default)
 func Load() (*Config, error) {
 	configPath := ResolveConfigPath()
-	fmt.Printf("[CONFIG] Loading configuration from: %s\n", configPath)
+	slog.Info("loading configuration", "path", configPath)
 	return LoadFromPath(configPath)
 }
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -20,6 +21,7 @@ type OpenCodeClient struct {
 	defaultProvider provider.Provider
 	atomic           *config.AtomicConfig
 	httpClient       *http.Client
+	logger           *slog.Logger
 }
 
 // EndpointConfig holds configuration for a specific API endpoint.
@@ -40,6 +42,7 @@ func NewOpenCodeClient(atomic *config.AtomicConfig) *OpenCodeClient {
 	return &OpenCodeClient{
 		atomic:    atomic,
 		httpClient: createHTTPClient(timeout),
+		logger:    slog.Default(),
 	}
 }
 
@@ -53,6 +56,7 @@ func NewOpenCodeClientWithProvider(p provider.Provider) *OpenCodeClient {
 	return &OpenCodeClient{
 		defaultProvider: p,
 		httpClient:      createHTTPClient(timeout),
+		logger:          slog.Default(),
 	}
 }
 
@@ -86,27 +90,27 @@ func (c *OpenCodeClient) getEndpoint(modelID string, providerName string) Endpoi
 	var p provider.Provider
 	var err error
 
-	fmt.Printf("[DEBUG] getEndpoint called - modelID: %s, providerName: %s\n", modelID, providerName)
+	c.logger.Debug("getEndpoint called", "modelID 【", modelID, "】 providerName【", providerName,"】")
 
 	// Try to get provider by name if specified
 	if providerName != "" {
 		p, err = provider.Get(providerName)
 		if err == nil {
 			ep := p.EndpointConfig(modelID)
-			fmt.Printf("[DEBUG] Using provider %s, BaseURL: %s, EndpointType: %s\n", providerName, ep.BaseURL, ep.EndpointType)
+			c.logger.Debug("using provider", "provider", providerName, "baseURL", ep.BaseURL, "endpointType", ep.EndpointType)
 			return EndpointConfig{
 				BaseURL:      ep.BaseURL,
 				APIKey:       ep.APIKey,
 				EndpointType: ep.EndpointType,
 			}
 		}
-		fmt.Printf("[DEBUG] Provider %s not found, error: %v\n", providerName, err)
+		c.logger.Error("provider not found", "provider", providerName, "error", err)
 	}
 
 	// Fall back to default provider
 	if c.defaultProvider != nil {
 		ep := c.defaultProvider.EndpointConfig(modelID)
-		fmt.Printf("[DEBUG] Using default provider, BaseURL: %s, EndpointType: %s\n", ep.BaseURL, ep.EndpointType)
+		c.logger.Debug("Using default provider", "baseURL", ep.BaseURL, "endpointType", ep.EndpointType)
 		return EndpointConfig{
 			BaseURL:      ep.BaseURL,
 			APIKey:       ep.APIKey,
@@ -244,7 +248,7 @@ func (c *OpenCodeClient) SendAnthropicRequest(
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("failed to parse request body for model extraction: %w", err)
 	}
-	fmt.Printf("[DEBUG] SendAnthropicRequest - extracted model: %s, provider: %s\n", req.Model, providerName)
+	c.logger.Info("SendAnthropicRequest", "model【", req.Model, "】provider", providerName)
 	
 	endpoint := c.getEndpoint(req.Model, providerName)
 	
