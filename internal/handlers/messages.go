@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"oc-go-cc/internal/client"
+	"oc-go-cc/internal/complexity"
 	"oc-go-cc/internal/config"
 	"oc-go-cc/internal/metrics"
 	"oc-go-cc/internal/middleware"
@@ -175,40 +176,35 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		)
 	}
 
-	// Build message content for routing and token counting.
-	var routerMessages []router.MessageContent
+	// Build message content for token counting (used for logging).
 	var tokenMessages []token.MessageContent
 	systemText := anthropicReq.SystemText()
 
 	for _, msg := range anthropicReq.Messages {
 		blocks := msg.ContentBlocks()
 		content := extractTextFromBlocks(blocks)
-		mc := router.MessageContent{
-			Role:    msg.Role,
-			Content: content,
-		}
-		routerMessages = append(routerMessages, mc)
 		tokenMessages = append(tokenMessages, token.MessageContent{
 			Role:    msg.Role,
 			Content: content,
 		})
 	}
 
-	// Count tokens.
 	tokenCount, err := h.tokenCounter.CountMessages(systemText, tokenMessages)
 	if err != nil {
 		h.logger.Warn("failed to count tokens", "error", err)
 		tokenCount = 0
 	}
 
-	// Route to appropriate model.
+	// Build complexity request for routing.
+	compReq := h.buildComplexityRequest(&anthropicReq, systemText)
+
+	// Route to appropriate model using complexity analysis.
 	var routeResult router.RouteResult
 	if isStreaming && !h.modelRouter.IsStreamingScenarioRoutingEnabled() {
-		// Streaming: use faster models to minimize TTFT (time-to-first-token)
-		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
+		routeResult = h.modelRouter.RouteForStreamingWithComplexity(compReq)
 	} else {
 		var err error
-		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount, anthropicReq.Model)
+		routeResult, err = h.modelRouter.RouteWithComplexity(compReq, anthropicReq.Model)
 		if err != nil {
 			h.sendError(w, http.StatusInternalServerError, "routing failed", err)
 			return
@@ -219,6 +215,7 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		"scenario", routeResult.Scenario,
 		"model", routeResult.Primary.ModelID,
 		"tokens", tokenCount,
+		"scenario_reason", routeResult.Reason,
 	)
 
 	// Build fallback chain.
@@ -350,7 +347,7 @@ func (h *MessagesHandler) handleStreaming(
 				"request_format", "anthropic",
 				"provider_base_url", baseURL,
 				"provider_anthropic_url", anthropicBaseURL,
-				"body", string(modelBody)[:min(len(modelBody), 10000)],
+				"body", string(modelBody),
 			)
 			}
 			
@@ -366,7 +363,7 @@ func (h *MessagesHandler) handleStreaming(
 					"provider", model.Provider,
 					"call_method", "anthropic_streaming",
 					"error", err,
-					"request_body", string(modelBody)[:min(len(modelBody), 10000)],
+					"request_body", string(modelBody)[:min(len(modelBody), 1000)],
 				)
 				continue
 			}
@@ -378,7 +375,7 @@ func (h *MessagesHandler) handleStreaming(
 		}
 
 		// For OpenAI-compatible models, transform and send to OpenAI endpoint
-		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
+		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model, false)
 		if err != nil {
 			cancel()
 			reqBody, _ := json.Marshal(anthropicReq)
@@ -388,7 +385,7 @@ func (h *MessagesHandler) handleStreaming(
 				"provider", model.Provider,
 				"call_method", "openai_streaming",
 				"error", err,
-				"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+				"request_body", string(reqBody)[:min(len(reqBody), 1000)],
 			)
 			continue
 		}
@@ -413,7 +410,7 @@ func (h *MessagesHandler) handleStreaming(
 				"request_format", "openai",
 				"provider_base_url", baseURL,
 				"provider_anthropic_url", anthropicBaseURL,
-				"body", string(reqBody)[:min(len(reqBody), 10000)],
+				"body", string(reqBody),
 			)
 		}
 
@@ -432,7 +429,7 @@ func (h *MessagesHandler) handleStreaming(
 				"provider", model.Provider,
 				"call_method", "openai_streaming",
 				"error", err,
-				"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+				"request_body", string(reqBody)[:min(len(reqBody), 1000)],
 			)
 			continue
 		}
@@ -456,7 +453,7 @@ func (h *MessagesHandler) handleStreaming(
 				"provider", model.Provider,
 				"call_method", "openai_streaming",
 				"error", err,
-				"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+				"request_body", string(reqBody)[:min(len(reqBody), 1000)],
 			)
 			continue
 		}
@@ -521,7 +518,7 @@ func (h *MessagesHandler) handleAnthropicStreaming(
 		"provider", providerName,
 		"request_format", "anthropic",
 		"body_length", len(bodyStr),
-		"body", bodyStr[:min(len(bodyStr), 10000)])
+		"body", bodyStr)
 	
 	// Log tools section specifically if present
 	if idx := strings.Index(bodyStr, `"tools":`); idx != -1 {
@@ -636,7 +633,7 @@ func (h *MessagesHandler) handleNonStreaming(
 	if h.logger.Enabled(context.Background(), slog.LevelDebug) {
 		h.logger.Debug("response body",
 			"request_id", requestID,
-			"body", string(responseBody)[:min(len(responseBody), 10000)],
+			"body", string(responseBody),
 		)
 	}
 
@@ -668,7 +665,7 @@ func (h *MessagesHandler) executeAnthropicRequest(
 			"request_format", "anthropic",
 			"provider_base_url", baseURL,
 			"provider_anthropic_url", anthropicBaseURL,
-			"body", string(rawBody)[:min(len(rawBody), 10000)],
+			"body", string(rawBody),
 		)
 	}
 	
@@ -680,7 +677,7 @@ func (h *MessagesHandler) executeAnthropicRequest(
 			"provider", model.Provider,
 			"call_method", "anthropic_non_streaming",
 			"error", err,
-			"request_body", string(rawBody)[:min(len(rawBody), 10000)],
+			"request_body", string(rawBody)[:min(len(rawBody), 1000)],
 		)
 		return nil, fmt.Errorf("anthropic request failed: %w", err)
 	}
@@ -693,7 +690,7 @@ func (h *MessagesHandler) executeAnthropicRequest(
 			"provider", model.Provider,
 			"call_method", "anthropic_non_streaming",
 			"error", err,
-			"request_body", string(rawBody)[:min(len(rawBody), 10000)],
+			"request_body", string(rawBody)[:min(len(rawBody), 1000)],
 		)
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
@@ -710,7 +707,7 @@ func (h *MessagesHandler) executeOpenAIRequest(
 	model config.ModelConfig,
 ) ([]byte, error) {
 	// Transform request to OpenAI format.
-	openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
+	openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model, false)
 	if err != nil {
 		reqBody, _ := json.Marshal(anthropicReq)
 		h.logger.Warn("request transform failed, trying fallback",
@@ -718,7 +715,7 @@ func (h *MessagesHandler) executeOpenAIRequest(
 			"provider", model.Provider,
 			"call_method", "openai_non_streaming",
 			"error", err,
-			"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+			"request_body", string(reqBody)[:min(len(reqBody), 1000)],
 		)
 		return nil, fmt.Errorf("request transform failed: %w", err)
 	}
@@ -742,7 +739,7 @@ func (h *MessagesHandler) executeOpenAIRequest(
 			"request_format", "openai",
 			"provider_base_url", baseURL,
 			"provider_anthropic_url", anthropicBaseURL,
-			"body", string(reqBody)[:min(len(reqBody), 10000)],
+			"body", string(reqBody),
 		)
 	}
 
@@ -755,7 +752,7 @@ func (h *MessagesHandler) executeOpenAIRequest(
 			"provider", model.Provider,
 			"call_method", "openai_non_streaming",
 			"error", err,
-			"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+			"request_body", string(reqBody)[:min(len(reqBody), 1000)],
 		)
 		return nil, fmt.Errorf("chat completion failed: %w", err)
 	}
@@ -769,8 +766,8 @@ func (h *MessagesHandler) executeOpenAIRequest(
 			"provider", model.Provider,
 			"call_method", "openai_non_streaming",
 			"error", err,
-			"request_body", string(reqBody)[:min(len(reqBody), 10000)],
-			"response_body", string(respBody)[:min(len(respBody), 10000)],
+			"request_body", string(reqBody)[:min(len(reqBody), 1000)],
+			"response_body", string(respBody)[:min(len(respBody), 1000)],
 		)
 		return nil, fmt.Errorf("response transform failed: %w", err)
 	}
@@ -783,7 +780,7 @@ func (h *MessagesHandler) executeOpenAIRequest(
 			"provider", model.Provider,
 			"call_method", "openai_non_streaming",
 			"error", err,
-			"request_body", string(reqBody)[:min(len(reqBody), 10000)],
+			"request_body", string(reqBody)[:min(len(reqBody), 1000)],
 			"anthropic_resp", fmt.Sprintf("%+v", anthropicResp),
 		)
 		return nil, fmt.Errorf("failed to marshal response: %w", err)
@@ -793,7 +790,7 @@ func (h *MessagesHandler) executeOpenAIRequest(
 		h.logger.Debug("openai response transformed",
 			"model", model.ModelID,
 			"provider", model.Provider,
-			"body", string(responseBody)[:min(len(responseBody), 10000)],
+			"body", string(responseBody),
 		)
 	}
 
@@ -812,12 +809,51 @@ func extractTextFromBlocks(blocks []types.ContentBlock) string {
 		case "tool_result":
 			content += block.TextContent()
 		case "thinking":
-			// Skip thinking blocks for text extraction
 		case "image":
 			content += "[Image]"
 		}
 	}
 	return content
+}
+
+func (h *MessagesHandler) buildComplexityRequest(anthropicReq *types.MessageRequest, systemText string) *complexity.Request {
+	compReq := &complexity.Request{
+		Model:     anthropicReq.Model,
+		MaxTokens: anthropicReq.MaxTokens,
+	}
+
+	if systemText != "" {
+		compReq.System = []complexity.SystemBlock{
+			{Type: "text", Text: systemText},
+		}
+	}
+
+	for _, msg := range anthropicReq.Messages {
+		blocks := msg.ContentBlocks()
+		content := extractTextFromBlocks(blocks)
+		compBlocks := make([]complexity.ContentBlock, 0, len(blocks))
+		for _, b := range blocks {
+			compBlocks = append(compBlocks, complexity.ContentBlock{
+				Type: b.Type,
+				Name: b.Name,
+				Text: b.Text,
+			})
+		}
+		compReq.Messages = append(compReq.Messages, complexity.Message{
+			Role:    msg.Role,
+			Content: content,
+			Blocks:  compBlocks,
+		})
+	}
+
+	for _, tool := range anthropicReq.Tools {
+		compReq.Tools = append(compReq.Tools, complexity.ToolDefinition{
+			Name:        tool.Name,
+			Description: tool.Description,
+		})
+	}
+
+	return compReq
 }
 
 // sendError sends an error response in Anthropic format.

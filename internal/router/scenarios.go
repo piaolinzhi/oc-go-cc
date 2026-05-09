@@ -4,46 +4,33 @@ import (
 	"fmt"
 	"strings"
 
+	"oc-go-cc/internal/complexity"
 	"oc-go-cc/internal/config"
 )
 
-// Scenario represents the routing scenario for model selection.
 type Scenario string
 
 const (
 	ScenarioDefault     Scenario = "default"
-	ScenarioBackground  Scenario = "background"
-	ScenarioThink       Scenario = "think"
-	ScenarioComplex     Scenario = "complex"
+	ScenarioBackground Scenario = "background"
+	ScenarioThink     Scenario = "think"
+	ScenarioComplex    Scenario = "complex"
 	ScenarioLongContext Scenario = "long_context"
-	ScenarioFast        Scenario = "fast"
+	ScenarioFast      Scenario = "fast"
 )
 
-// ScenarioResult contains the detected scenario and token count.
 type ScenarioResult struct {
 	Scenario   Scenario
 	TokenCount int
-	Reason     string
+	Reason    string
 }
 
-// MessageContent represents a single message in a conversation.
 type MessageContent struct {
 	Role    string
 	Content string
 }
 
-// DetectScenario analyzes a request to determine which model to use.
-// Routing priority:
-//  1. Long Context (> threshold) - 硬性限制，最先判断
-//  2. Model Tier (sonnet -> think, haiku -> fast)
-//  3. Complex (architectural patterns or tool-heavy operations)
-//  4. Think (reasoning patterns)
-//  5. Background (simple operations with NO tools)
-//  6. Default
-//
-// For streaming requests, consider using RouteForStreaming() to prefer faster models.
 func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Config, modelID string) ScenarioResult {
-	// 1. Check for long context first (most important - hard constraint)
 	threshold := getLongContextThreshold(cfg)
 	if tokenCount > threshold {
 		return ScenarioResult{
@@ -53,7 +40,6 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		}
 	}
 
-	// 2. Check model tier (sonnet -> think, haiku -> fast)
 	if tier := getModelTier(modelID); tier != "" {
 		switch tier {
 		case "sonnet":
@@ -71,34 +57,6 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 		}
 	}
 
-	// 3. Check for complex tasks (architectural OR tool-related)
-	if hasComplexPattern(messages) {
-		return ScenarioResult{
-			Scenario:   ScenarioComplex,
-			TokenCount: tokenCount,
-			Reason:     "complex or tool-based operation detected (Recommand GLM-5.1)",
-		}
-	}
-
-	// 4. Check for thinking/reasoning patterns
-	if hasThinkingPattern(messages) {
-		return ScenarioResult{
-			Scenario:   ScenarioThink,
-			TokenCount: tokenCount,
-			Reason:     "thinking/reasoning pattern detected (Recommand GLM-5)",
-		}
-	}
-
-	// 5. Check for background task patterns (truly simple operations)
-	if hasBackgroundPattern(messages) {
-		return ScenarioResult{
-			Scenario:   ScenarioBackground,
-			TokenCount: tokenCount,
-			Reason:     "simple background task detected (Recommand Qwen3.5 Plus)",
-		}
-	}
-
-	// 6. Default
 	return ScenarioResult{
 		Scenario:   ScenarioDefault,
 		TokenCount: tokenCount,
@@ -106,113 +64,163 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 	}
 }
 
-// hasComplexPattern looks for complex operations that need more capable models.
-// This includes tool-based operations (executing functions, writing/editing files, etc.)
-func hasComplexPattern(messages []MessageContent) bool {
-	complexKeywords := []string{
-		// Architectural
-		"architect", "architecture", "refactor", "redesign",
-		"complex", "difficult", "challenging",
-		"optimize", "performance", "efficiency",
-		"design pattern", "best practice",
-		// Tool-related keywords indicate complex operations
-		"execute", "run command", "bash", "shell",
-		"implement", "build", "create", "add feature",
-		"write to", "edit file", "create file",
+func DetectScenarioWithComplexity(compReq *complexity.Request, cfg *config.Config, modelID string) ScenarioResult {
+	threshold := getLongContextThreshold(cfg)
+	if compReq == nil {
+		return ScenarioResult{
+			Scenario:   ScenarioFast,
+			TokenCount: 0,
+			Reason:     "nil request, fast scenario",
+		}
 	}
 
-	for _, msg := range messages {
-		if msg.Role == "system" || msg.Role == "user" {
-			lower := strings.ToLower(msg.Content)
-			for _, kw := range complexKeywords {
-				if strings.Contains(lower, kw) {
-					return true
-				}
+	result, err := complexity.Analyze(compReq)
+	if err != nil {
+		return ScenarioResult{
+			Scenario:   ScenarioFast,
+			TokenCount: 0,
+			Reason:     fmt.Sprintf("complexity analysis failed: %v, fast scenario", err),
+		}
+	}
+
+	tokenCount := result.Metrics.TotalTokens
+
+	if tokenCount > threshold {
+		return ScenarioResult{
+			Scenario:   ScenarioLongContext,
+			TokenCount: tokenCount,
+			Reason:     fmt.Sprintf("token count %d exceeds threshold %d (Recommand MiniMax for 1M context)", tokenCount, threshold),
+		}
+	}
+
+	if tier := getModelTier(modelID); tier != "" {
+		switch tier {
+		case "sonnet":
+			return ScenarioResult{
+				Scenario:   ScenarioThink,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("model tier sonnet -> think scenario (model: %s)", modelID),
+			}
+		case "haiku":
+			return ScenarioResult{
+				Scenario:   ScenarioFast,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("model tier haiku -> fast scenario (model: %s)", modelID),
 			}
 		}
 	}
-	return false
+
+	if complexity.HasWriteToolsInCurrentUserMessage(compReq) {
+		switch result.Level {
+		case complexity.LevelExtreme:
+			return ScenarioResult{
+				Scenario:   ScenarioComplex,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("complexity score %d (extreme): %s (Recommand GLM-5.1)", result.TotalScore, summarizeDimensions(result)),
+			}
+		case complexity.LevelComplex:
+			return ScenarioResult{
+				Scenario:   ScenarioThink,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("complexity score %d (complex): %s (Recommand GLM-5)", result.TotalScore, summarizeDimensions(result)),
+			}
+		case complexity.LevelMedium:
+			return ScenarioResult{
+				Scenario:   ScenarioDefault,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("complexity score %d (medium): %s (Recommand Kimi K2.6)", result.TotalScore, summarizeDimensions(result)),
+			}
+		default:
+			return ScenarioResult{
+				Scenario:   ScenarioDefault,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("complexity score %d (simple): has write tools (Recommand Kimi K2.6)", result.TotalScore),
+			}
+		}
+	}
+
+	if hasComplexKeywordsInCurrentMessage(compReq) {
+		switch result.Level {
+		case complexity.LevelExtreme:
+			return ScenarioResult{
+				Scenario:   ScenarioComplex,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("complexity score %d (extreme): %s (Recommand GLM-5.1)", result.TotalScore, summarizeDimensions(result)),
+			}
+		case complexity.LevelComplex:
+			return ScenarioResult{
+				Scenario:   ScenarioThink,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("complexity score %d (complex): %s (Recommand GLM-5)", result.TotalScore, summarizeDimensions(result)),
+			}
+		default:
+			return ScenarioResult{
+				Scenario:   ScenarioThink,
+				TokenCount: tokenCount,
+				Reason:     fmt.Sprintf("complexity score %d (medium): has complex keywords (Recommand GLM-5)", result.TotalScore),
+			}
+		}
+	}
+
+	if hasActualSimpleToolCalls(compReq) || hasSimpleMessagePattern(compReq) {
+		return ScenarioResult{
+			Scenario:   ScenarioFast,
+			TokenCount: tokenCount,
+			Reason:     fmt.Sprintf("simple read-only operation detected (Recommand Qwen3.5 Plus)"),
+		}
+	}
+
+	switch result.Level {
+	case complexity.LevelExtreme:
+		return ScenarioResult{
+			Scenario:   ScenarioComplex,
+			TokenCount: tokenCount,
+			Reason:     fmt.Sprintf("complexity score %d (extreme): %s (Recommand GLM-5.1)", result.TotalScore, summarizeDimensions(result)),
+		}
+	case complexity.LevelComplex:
+		return ScenarioResult{
+			Scenario:   ScenarioThink,
+			TokenCount: tokenCount,
+			Reason:     fmt.Sprintf("complexity score %d (complex): %s (Recommand GLM-5)", result.TotalScore, summarizeDimensions(result)),
+		}
+	case complexity.LevelMedium:
+		return ScenarioResult{
+			Scenario:   ScenarioDefault,
+			TokenCount: tokenCount,
+			Reason:     fmt.Sprintf("complexity score %d (medium): %s (Recommand Kimi K2.6)", result.TotalScore, summarizeDimensions(result)),
+		}
+	default:
+		return ScenarioResult{
+			Scenario:   ScenarioFast,
+			TokenCount: tokenCount,
+			Reason:     fmt.Sprintf("complexity score %d (simple): fast scenario (Recommand Qwen3.5 Plus)", result.TotalScore),
+		}
+	}
 }
 
-// hasThinkingPattern looks for system prompts mentioning reasoning keywords
-// or content containing thinking/reasoning markers.
-func hasThinkingPattern(messages []MessageContent) bool {
-	thinkingKeywords := []string{
-		"think", "thinking", "plan", "reason", "reasoning",
-		"analyze", "analysis", "step by step",
-	}
-
-	for _, msg := range messages {
-		if msg.Role == "system" || msg.Role == "user" {
-			lower := strings.ToLower(msg.Content)
-			for _, kw := range thinkingKeywords {
-				if strings.Contains(lower, kw) {
-					return true
-				}
-			}
-		}
-		// Check for thinking content blocks
-		if strings.Contains(msg.Content, "antThinking") {
-			return true
+func summarizeDimensions(r *complexity.Result) string {
+	parts := []string{}
+	for _, d := range r.Dimensions {
+		if d.Score > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d/%d", d.Name, d.Score, d.MaxScore))
 		}
 	}
-	return false
+	if len(parts) == 0 {
+		return "no pressure"
+	}
+	return strings.Join(parts, ", ")
 }
 
-// hasBackgroundPattern checks for VERY simple background tasks.
-// IMPORTANT: This should be conservative - returns true only for truly trivial requests.
-// If there's any mention of tools, functions, or writing, it's NOT background.
-func hasBackgroundPattern(messages []MessageContent) bool {
-	// If ANY tool keywords appear, it's NOT a background task
-	toolBlockers := []string{
-		"tool", "function", "execute", "run command",
-		"write", "edit", "create", "delete", "remove",
-		"implement", "build", "add", "modify",
-	}
-
-	for _, msg := range messages {
-		lower := strings.ToLower(msg.Content)
-		for _, kw := range toolBlockers {
-			if strings.Contains(lower, kw) {
-				return false
-			}
-		}
-	}
-
-	// Only truly simple operations are background tasks
-	backgroundKeywords := []string{
-		"list directory", "ls -", "dir",
-		"show file", "view file", "cat file",
-		"what is", "what's", "tell me about",
-		"check status", "show status",
-	}
-
-	for _, msg := range messages {
-		lower := strings.ToLower(msg.Content)
-		for _, kw := range backgroundKeywords {
-			if strings.Contains(lower, kw) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// getLongContextThreshold returns the configured threshold or a sensible default.
-// Default is 100K tokens to trigger long-context models (1M context) vs regular models (128-256K).
 func getLongContextThreshold(cfg *config.Config) int {
 	if cfg == nil {
-		return 100000 // Default: 100K tokens
+		return 100000
 	}
 	if lc, ok := cfg.Models["long_context"]; ok && lc.ContextThreshold > 0 {
 		return lc.ContextThreshold
 	}
-	return 100000 // Default: 100K tokens
+	return 100000
 }
 
-// getModelTier extracts the model tier from a model ID.
-// Model ID format: claude-{tier}-{version}, e.g., claude-sonnet-5-7, claude-haiku-4-7
-// Returns: "sonnet", "haiku", "opus", or "" if unknown
 func getModelTier(modelID string) string {
 	modelID = strings.ToLower(modelID)
 	if strings.Contains(modelID, "sonnet") {
@@ -224,13 +232,138 @@ func getModelTier(modelID string) string {
 	return ""
 }
 
-// RouteForStreaming selects a model optimized for streaming latency.
-// For streaming, we prioritize fast TTFT (time-to-first-token) over capability.
-// This may return a less capable model but one that streams faster.
-func RouteForStreaming(messages []MessageContent, tokenCount int, cfg *config.Config) ScenarioResult {
-	// For streaming, use simpler models that have better TTFT
-	// Complex models (GLM, Kimi) are too slow for streaming with many tools
+var simpleReadOnlyTools = []string{
+	"explore",
+	"search",
+	"grep",
+	"read",
+	"view",
+	"cat",
+	"ls",
+	"list",
+	"find",
+	"fetch",
+	"get",
+	"query",
+	"inspect",
+}
 
+var simpleMessagePatterns = []string{
+	"list directory",
+	"ls -la",
+	"ls -l",
+	"ls -",
+	"show file",
+	"view file",
+	"cat file",
+	"cat /",
+	"cat ./",
+	"what is this",
+	"what's this",
+	"tell me about",
+	"check status",
+	"show status",
+}
+
+var complexKeywords = []string{
+	"architect", "architecture", "refactor", "redesign",
+	"complex", "challenging",
+	"optimize", "performance", "efficiency",
+	"design pattern", "best practice",
+	"execute", "bash", "shell",
+	"create",
+	"write to", "edit file", "create file",
+	"重构", "重写", "重新设计",
+	"架构", "架构设计", "系统设计",
+	"优化", "性能优化", "提升性能",
+	"复杂", "挑战",
+	"最佳实践", "设计模式",
+	"执行", "运行脚本", "运行命令",
+	"部署",
+}
+
+func isSimpleToolOnly(req *complexity.Request) bool {
+	if req == nil || len(req.Tools) == 0 {
+		return false
+	}
+	for _, tool := range req.Tools {
+		name := strings.ToLower(tool.Name)
+		for _, t := range simpleReadOnlyTools {
+			if strings.Contains(name, t) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasActualSimpleToolCalls(req *complexity.Request) bool {
+	if req == nil {
+		return false
+	}
+	for _, msg := range req.Messages {
+		for _, block := range msg.Blocks {
+			if block.Type == "tool_use" {
+				name := strings.ToLower(block.Name)
+				for _, t := range simpleReadOnlyTools {
+					if strings.Contains(name, t) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func hasSimpleMessagePattern(req *complexity.Request) bool {
+	if req == nil {
+		return false
+	}
+	allText := strings.ToLower(strings.Join(extractAllTexts(req), " "))
+	for _, pattern := range simpleMessagePatterns {
+		if strings.Contains(allText, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasComplexKeywordsInCurrentMessage(req *complexity.Request) bool {
+	if req == nil {
+		return false
+	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		msg := req.Messages[i]
+		if msg.Role == "user" {
+			text := strings.ToLower(msg.Content)
+			for _, keyword := range complexKeywords {
+				if strings.Contains(text, keyword) {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return false
+}
+
+func extractAllTexts(req *complexity.Request) []string {
+	var texts []string
+	for _, s := range req.System {
+		if s.Text != "" {
+			texts = append(texts, s.Text)
+		}
+	}
+	for _, msg := range req.Messages {
+		if msg.Content != "" {
+			texts = append(texts, msg.Content)
+		}
+	}
+	return texts
+}
+
+func RouteForStreaming(messages []MessageContent, tokenCount int, cfg *config.Config) ScenarioResult {
 	threshold := getLongContextThreshold(cfg)
 	if tokenCount > threshold {
 		model := "long_context"
@@ -246,20 +379,51 @@ func RouteForStreaming(messages []MessageContent, tokenCount int, cfg *config.Co
 		}
 	}
 
-	if hasComplexPattern(messages) || hasThinkingPattern(messages) {
-		// Complex request but streaming - downgrade to faster model
-		// GLM-5 and Kimi are too slow for streaming with complex prompts
-		return ScenarioResult{
-			Scenario:   ScenarioFast,
-			TokenCount: tokenCount,
-			Reason:     "complex request but streaming - use fast model (qwen3.6-plus) for better TTFT",
-		}
-	}
-
-	// Default to fast scenario for streaming
 	return ScenarioResult{
 		Scenario:   ScenarioFast,
 		TokenCount: tokenCount,
 		Reason:     "streaming request - use fast model (qwen3.6-plus)",
+	}
+}
+
+func RouteForStreamingWithComplexity(compReq *complexity.Request, cfg *config.Config) ScenarioResult {
+	if compReq == nil {
+		return ScenarioResult{
+			Scenario:   ScenarioFast,
+			TokenCount: 0,
+			Reason:     "nil request, fast scenario for streaming",
+		}
+	}
+
+	result, err := complexity.Analyze(compReq)
+	if err != nil {
+		return ScenarioResult{
+			Scenario:   ScenarioFast,
+			TokenCount: 0,
+			Reason:     fmt.Sprintf("complexity analysis failed: %v, fast scenario for streaming", err),
+		}
+	}
+
+	tokenCount := result.Metrics.TotalTokens
+	threshold := getLongContextThreshold(cfg)
+
+	if tokenCount > threshold {
+		model := "long_context"
+		if cfg != nil {
+			if lc, ok := cfg.Models["long_context"]; ok && lc.ModelID != "" {
+				model = lc.ModelID
+			}
+		}
+		return ScenarioResult{
+			Scenario:   ScenarioLongContext,
+			TokenCount: tokenCount,
+			Reason:     fmt.Sprintf("high token count streaming (%d > %d) - use %s for acceptable TTFT", tokenCount, threshold, model),
+		}
+	}
+
+	return ScenarioResult{
+		Scenario:   ScenarioFast,
+		TokenCount: tokenCount,
+		Reason:     fmt.Sprintf("streaming request (complexity: %d/%s) - use fast model (qwen3.6-plus)", result.TotalScore, result.Level),
 	}
 }

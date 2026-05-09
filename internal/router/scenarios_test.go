@@ -4,64 +4,10 @@ import (
 	"strings"
 	"testing"
 
+	"oc-go-cc/internal/complexity"
 	"oc-go-cc/internal/config"
 )
 
-func TestHasComplexPattern_UserMessage(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "user", Content: "Please refactor this code to use interfaces"},
-	}
-	if !hasComplexPattern(messages) {
-		t.Error("Expected hasComplexPattern to detect 'refactor' in user message")
-	}
-}
-
-func TestHasComplexPattern_SystemMessage(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "system", Content: "Please architect the new service"},
-	}
-	if !hasComplexPattern(messages) {
-		t.Error("Expected hasComplexPattern to detect 'architect' in system message")
-	}
-}
-
-func TestHasComplexPattern_NoMatch(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "user", Content: "Hello, how are you?"},
-	}
-	if hasComplexPattern(messages) {
-		t.Error("Expected hasComplexPattern to not match simple greeting")
-	}
-}
-
-func TestHasThinkingPattern_UserMessage(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "user", Content: "Think through this problem step by step"},
-	}
-	if !hasThinkingPattern(messages) {
-		t.Error("Expected hasThinkingPattern to detect 'think' and 'step by step' in user message")
-	}
-}
-
-func TestHasThinkingPattern_SystemMessage(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "system", Content: "You are a reasoning agent"},
-	}
-	if !hasThinkingPattern(messages) {
-		t.Error("Expected hasThinkingPattern to detect 'reasoning' in system message")
-	}
-}
-
-func TestHasThinkingPattern_AnthropicThinkingBlock(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "user", Content: "Solve this problem antThinking(thinking block)"},
-	}
-	if !hasThinkingPattern(messages) {
-		t.Error("Expected hasThinkingPattern to detect 'antThinking' block")
-	}
-}
-
-// mockConfig returns a minimal config for testing
 func mockConfig() *config.Config {
 	return &config.Config{
 		Models: map[string]config.ModelConfig{
@@ -72,42 +18,171 @@ func mockConfig() *config.Config {
 	}
 }
 
-func TestDetectScenario_ComplexFromUser(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "user", Content: "Architect a new microservice for user authentication"},
+func TestDetectScenarioWithComplexity_Simple(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "Hello, how are you?"},
+		},
 	}
-	result := DetectScenario(messages, 100, mockConfig())
-	if result.Scenario != ScenarioComplex {
-		t.Errorf("Expected ScenarioComplex, got %s", result.Scenario)
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for simple request, got %s (reason: %s)", result.Scenario, result.Reason)
 	}
 }
 
-func TestDetectScenario_ThinkFromUser(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "user", Content: "Analyze the tradeoffs of this design"},
+func TestDetectScenarioWithComplexity_Complex(t *testing.T) {
+	cfg := &config.Config{
+		Models: map[string]config.ModelConfig{
+			"long_context": {
+				ContextThreshold: 1000000,
+			},
+		},
 	}
-	result := DetectScenario(messages, 100, mockConfig())
+	longText := ""
+	for i := 0; i < 15000; i++ {
+		longText += "你必须按照规范实现，禁止使用违规方法，必须遵循最佳实践，必须保证代码质量。"
+	}
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		System: []complexity.SystemBlock{
+			{Type: "text", Text: longText},
+		},
+		Messages: []complexity.Message{
+			{Role: "user", Content: "system-reminder: memory item 1"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "system-reminder: memory item 2"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "system-reminder: memory item 3"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "system-reminder: memory item 4"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "system-reminder: memory item 5"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "system-reminder: memory item 6"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "system-reminder: memory item 7"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "system-reminder: memory item 8"},
+			{Role: "assistant", Content: "ok"},
+			{Role: "user", Content: "step 1. step 2. step 3. step 4. step 5. step 6. step 7. step 8. step 9. step 10. step 11. step 12. step 13.", Blocks: []complexity.ContentBlock{
+				{Type: "tool_use", Name: "write_file", Text: "create new file"},
+			}},
+		},
+		Tools: []complexity.ToolDefinition{
+			{Name: "read_file", Description: "read"},
+			{Name: "write_file", Description: "write"},
+			{Name: "edit_file", Description: "edit"},
+			{Name: "search", Description: "search"},
+			{Name: "execute", Description: "exec"},
+			{Name: "deploy", Description: "deploy"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, cfg, "")
 	if result.Scenario != ScenarioThink {
-		t.Errorf("Expected ScenarioThink, got %s", result.Scenario)
+		t.Errorf("Expected ScenarioThink for complex request with write tool call, got %s (reason: %s)", result.Scenario, result.Reason)
 	}
 }
 
-func TestDetectScenario_DefaultFromSimpleUserMessage(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "user", Content: "Hello, how are you?"},
+func TestDetectScenarioWithComplexity_LongContextPriority(t *testing.T) {
+	longText := ""
+	for i := 0; i < 5000; i++ {
+		longText += "这是一段很长的文本用来测试长上下文检测。"
 	}
-	result := DetectScenario(messages, 100, mockConfig())
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		System: []complexity.SystemBlock{
+			{Type: "text", Text: longText},
+		},
+		Messages: []complexity.Message{
+			{Role: "user", Content: "hello"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioLongContext {
+		t.Errorf("Expected ScenarioLongContext, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestDetectScenarioWithComplexity_ModelTierSonnet(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "hello"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "claude-sonnet-5-7")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for sonnet model, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestDetectScenarioWithComplexity_ModelTierHaiku(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-haiku-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "hello"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "claude-haiku-4-7")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for haiku model, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestDetectScenarioWithComplexity_NilRequest(t *testing.T) {
+	result := DetectScenarioWithComplexity(nil, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for nil request, got %s", result.Scenario)
+	}
+}
+
+func TestDetectScenarioWithComplexity_Medium(t *testing.T) {
+	longText := ""
+	for i := 0; i < 2000; i++ {
+		longText += "你必须按照规范实现，保证兼容性，禁止违反架构规范。"
+	}
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		System: []complexity.SystemBlock{
+			{Type: "text", Text: longText},
+		},
+		Messages: []complexity.Message{
+			{Role: "user", Content: "帮我写一个函数"},
+			{Role: "assistant", Content: "好的"},
+			{Role: "user", Content: "还需要处理错误"},
+			{Role: "assistant", Content: "已添加"},
+			{Role: "user", Content: "加上单元测试"},
+			{Role: "user", Content: "再加一个测试用例"},
+		},
+		Tools: []complexity.ToolDefinition{
+			{Name: "read_file", Description: "read"},
+			{Name: "write_file", Description: "write"},
+			{Name: "edit_file", Description: "edit"},
+			{Name: "search", Description: "search"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario == ScenarioDefault || result.Scenario == ScenarioBackground {
+		t.Errorf("Expected non-trivial scenario for medium request, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestDetectScenario_OldAPI(t *testing.T) {
+	messages := []MessageContent{
+		{Role: "user", Content: "Hello"},
+	}
+	result := DetectScenario(messages, 100, mockConfig(), "")
 	if result.Scenario != ScenarioDefault {
 		t.Errorf("Expected ScenarioDefault, got %s", result.Scenario)
 	}
 }
 
-func TestDetectScenario_LongContextTakesPriority(t *testing.T) {
+func TestDetectScenario_OldAPI_LongContext(t *testing.T) {
 	messages := []MessageContent{
 		{Role: "user", Content: "Refactor this code"},
 	}
-	// Token count > 60000 should trigger long_context regardless of content
-	result := DetectScenario(messages, 70000, mockConfig())
+	result := DetectScenario(messages, 70000, mockConfig(), "")
 	if result.Scenario != ScenarioLongContext {
 		t.Errorf("Expected ScenarioLongContext, got %s", result.Scenario)
 	}
@@ -126,13 +201,11 @@ func TestRouteForStreaming_RespectsConfiguredThreshold(t *testing.T) {
 		},
 	}
 
-	// Below threshold should NOT trigger long_context
 	result := RouteForStreaming(messages, 40955, cfg)
 	if result.Scenario == ScenarioLongContext {
 		t.Errorf("Expected NOT ScenarioLongContext for 40955 tokens with threshold 256000, got %s", result.Scenario)
 	}
 
-	// Above threshold should trigger long_context
 	result = RouteForStreaming(messages, 300000, cfg)
 	if result.Scenario != ScenarioLongContext {
 		t.Errorf("Expected ScenarioLongContext for 300000 tokens with threshold 256000, got %s", result.Scenario)
@@ -142,32 +215,11 @@ func TestRouteForStreaming_RespectsConfiguredThreshold(t *testing.T) {
 	}
 }
 
-func TestRouteForStreaming_UsesDefaultThresholdWhenNotConfigured(t *testing.T) {
-	messages := []MessageContent{
-		{Role: "user", Content: "Hello"},
-	}
-	cfg := &config.Config{
-		Models: map[string]config.ModelConfig{},
-	}
-
-	// Default threshold is 100000
-	result := RouteForStreaming(messages, 90000, cfg)
-	if result.Scenario == ScenarioLongContext {
-		t.Errorf("Expected NOT ScenarioLongContext for 90000 tokens with default threshold, got %s", result.Scenario)
-	}
-
-	result = RouteForStreaming(messages, 110000, cfg)
-	if result.Scenario != ScenarioLongContext {
-		t.Errorf("Expected ScenarioLongContext for 110000 tokens with default threshold, got %s", result.Scenario)
-	}
-}
-
 func TestRouteForStreaming_NilConfig(t *testing.T) {
 	messages := []MessageContent{
 		{Role: "user", Content: "Hello"},
 	}
 
-	// Default threshold is 100000; nil config should not panic
 	result := RouteForStreaming(messages, 90000, nil)
 	if result.Scenario == ScenarioLongContext {
 		t.Errorf("Expected NOT ScenarioLongContext for 90000 tokens with nil config, got %s", result.Scenario)
@@ -177,7 +229,236 @@ func TestRouteForStreaming_NilConfig(t *testing.T) {
 	if result.Scenario != ScenarioLongContext {
 		t.Errorf("Expected ScenarioLongContext for 110000 tokens with nil config, got %s", result.Scenario)
 	}
-	if !strings.Contains(result.Reason, "long_context") {
-		t.Errorf("Expected reason to contain fallback model name 'long_context', got: %s", result.Reason)
+}
+
+func TestRouteForStreamingWithComplexity(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "hello"},
+		},
+	}
+	result := RouteForStreamingWithComplexity(compReq, mockConfig())
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for streaming simple request, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestRouteForStreamingWithComplexity_LongContext(t *testing.T) {
+	longText := ""
+	for i := 0; i < 5000; i++ {
+		longText += "这是一段很长的文本用来测试长上下文检测。"
+	}
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		System: []complexity.SystemBlock{
+			{Type: "text", Text: longText},
+		},
+		Messages: []complexity.Message{
+			{Role: "user", Content: "hello"},
+		},
+	}
+	result := RouteForStreamingWithComplexity(compReq, mockConfig())
+	if result.Scenario != ScenarioLongContext {
+		t.Errorf("Expected ScenarioLongContext for streaming long request, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestRouteForStreamingWithComplexity_NilRequest(t *testing.T) {
+	result := RouteForStreamingWithComplexity(nil, mockConfig())
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for nil request, got %s", result.Scenario)
+	}
+}
+
+func TestIsSimpleToolOnly_Explore(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "explore the codebase"},
+		},
+		Tools: []complexity.ToolDefinition{
+			{Name: "explore", Description: "explore files"},
+			{Name: "search", Description: "search content"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for explore/search tools, got %s", result.Scenario)
+	}
+}
+
+func TestIsSimpleToolOnly_MixedTools(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "read and write files", Blocks: []complexity.ContentBlock{
+				{Type: "tool_use", Name: "write_file", Text: "write to file"},
+			}},
+		},
+		Tools: []complexity.ToolDefinition{
+			{Name: "read_file", Description: "read"},
+			{Name: "write_file", Description: "write"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario == ScenarioFast {
+		t.Errorf("Expected NOT ScenarioFast for current message with write tool call, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestIsSimpleToolOnly_NoTools(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "hello"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for hello, got %s", result.Scenario)
+	}
+}
+
+func TestHasSimpleMessagePattern_ListDirectory(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "list directory contents"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for list directory, got %s", result.Scenario)
+	}
+}
+
+func TestHasSimpleMessagePattern_WhatIs(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "what is this function doing?"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for what is question, got %s", result.Scenario)
+	}
+}
+
+func TestHasSimpleMessagePattern_CatFile(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "cat file /path/to/config"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for cat file, got %s", result.Scenario)
+	}
+}
+
+func TestHasComplexKeywords_Refactor(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "refactor this function"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for refactor, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestHasComplexKeywords_Execute(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "execute this script"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for execute, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestHasComplexKeywords_Architecture(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "improve the architecture design"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for architecture, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestHasComplexKeywords_Performance(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "optimize the performance"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for performance, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestHasComplexKeywords_Chinese_Refactor(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "帮我重构这个函数"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for Chinese refactor, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestHasComplexKeywords_Chinese_Architecture(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "优化系统架构"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for Chinese architecture, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestHasComplexKeywords_Chinese_Performance(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "提升性能"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for Chinese performance, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestHasComplexKeywords_Chinese_Deploy(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "部署应用到服务器"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioThink {
+		t.Errorf("Expected ScenarioThink for Chinese deploy, got %s (reason: %s)", result.Scenario, result.Reason)
 	}
 }

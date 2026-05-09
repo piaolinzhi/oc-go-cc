@@ -42,12 +42,17 @@ func needsPlaceholderReasoning(modelID string) bool {
 }
 
 // TransformRequest converts an Anthropic MessageRequest to OpenAI ChatCompletionRequest.
+// isAnthropicEndpoint indicates whether the target endpoint is Anthropic-compatible
+// (e.g., MiniMax). When false, Anthropic-specific fields like cache_control are stripped
+// unless model.SetCacheKey is true.
 func (t *RequestTransformer) TransformRequest(
 	anthropicReq *types.MessageRequest,
 	model config.ModelConfig,
+	isAnthropicEndpoint bool,
 ) (*types.ChatCompletionRequest, error) {
-	// Transform messages
-	messages, err := t.transformMessages(anthropicReq, model.ModelID)
+	// Include cache_control if endpoint is Anthropic-compatible OR model config enables it
+	includeCacheControl := isAnthropicEndpoint || model.SetCacheKey
+	messages, err := t.transformMessages(anthropicReq, model.ModelID, includeCacheControl)
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform messages: %w", err)
 	}
@@ -140,7 +145,9 @@ func HasThinkingBlocks(messages []types.Message) bool {
 }
 
 // transformMessages converts Anthropic messages to OpenAI format.
-func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageRequest, modelID string) ([]types.ChatMessage, error) {
+// includeCacheControl indicates whether to include cache_control from system message.
+// This should be true for Anthropic-compatible endpoints or when model.SetCacheKey is enabled.
+func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageRequest, modelID string, includeCacheControl bool) ([]types.ChatMessage, error) {
 	hasThinking := HasThinkingBlocks(anthropicReq.Messages)
 
 	var result []types.ChatMessage
@@ -152,8 +159,8 @@ func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageReques
 			Role:    "system",
 			Content: systemText,
 		}
-		// Try to extract cache_control from system array blocks
-		if len(anthropicReq.System) > 0 {
+		// Only extract cache_control when enabled via endpoint type or model config
+		if includeCacheControl && len(anthropicReq.System) > 0 {
 			var blocks []types.SystemContentBlock
 			if err := json.Unmarshal(anthropicReq.System, &blocks); err == nil {
 				for _, b := range blocks {

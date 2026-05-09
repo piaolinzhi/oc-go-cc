@@ -70,7 +70,7 @@ func TestTransformRequestRoundTripReasoning(t *testing.T) {
 
 	// Step 4: Transform back to OpenAI request.
 	qt := NewRequestTransformer()
-	openaiReq, err := qt.TransformRequest(anthropicReq, config.ModelConfig{ModelID: "deepseek-v4-flash"})
+	openaiReq, err := qt.TransformRequest(anthropicReq, config.ModelConfig{ModelID: "deepseek-v4-flash"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest error: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestTransformRequestPreservesThinkingAsReasoningContent(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -170,7 +170,7 @@ func TestTransformRequestIncludesStreamUsageOptions(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -196,7 +196,7 @@ func TestTransformRequestOmitsStreamUsageOptionsWhenStreamingDisabled(t *testing
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -222,7 +222,7 @@ func TestTransformRequestIncludesEmptyReasoningContentForToolCalls(t *testing.T)
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -252,7 +252,7 @@ func TestTransformRequestSerializesAssistantToolCallContent(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -300,7 +300,7 @@ func TestTransformRequestAppliesReasoningEffortAndThinking(t *testing.T) {
 		ModelID:         "deepseek-v4-pro",
 		ReasoningEffort: "max",
 		Thinking:        json.RawMessage(`{"type":"enabled"}`),
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -335,7 +335,7 @@ func TestTransformRequestStripsReasoningEffortWhenNoThinkingHistory(t *testing.T
 		ModelID:         "deepseek-v4-pro",
 		ReasoningEffort: "max",
 		Thinking:        json.RawMessage(`{"type":"enabled"}`),
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -364,7 +364,45 @@ func TestTransformRequestPreservesSystemCacheControl(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"}, false)
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if got, want := len(openaiReq.Messages), 2; got != want {
+		t.Fatalf("len(Messages) = %d, want %d", got, want)
+	}
+
+	systemMsg := openaiReq.Messages[0]
+	if got, want := systemMsg.Role, "system"; got != want {
+		t.Fatalf("Messages[0].Role = %q, want %q", got, want)
+	}
+	if got, want := systemMsg.Content, "You are helpful"; got != want {
+		t.Fatalf("Messages[0].Content = %q, want %q", got, want)
+	}
+	if systemMsg.CacheControl != nil {
+		t.Fatalf("Messages[0].CacheControl = %v, want nil for non-Anthropic endpoint", systemMsg.CacheControl)
+	}
+}
+
+func TestTransformRequestIncludesCacheControlWhenSetCacheKeyEnabled(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		System: json.RawMessage(`[
+			{"type":"text","text":"You are helpful","cache_control":{"type":"ephemeral"}}
+		]`),
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:      "kimi-k2.6",
+		SetCacheKey: true,
+	}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -381,7 +419,7 @@ func TestTransformRequestPreservesSystemCacheControl(t *testing.T) {
 		t.Fatalf("Messages[0].Content = %q, want %q", got, want)
 	}
 	if systemMsg.CacheControl == nil {
-		t.Fatal("Messages[0].CacheControl = nil, want non-nil")
+		t.Fatal("Messages[0].CacheControl = nil, want non-nil when SetCacheKey is enabled")
 	}
 	if got, want := systemMsg.CacheControl.Type, "ephemeral"; got != want {
 		t.Fatalf("Messages[0].CacheControl.Type = %q, want %q", got, want)
@@ -400,7 +438,7 @@ func TestTransformRequestOmitsCacheControlWhenAbsent(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -441,7 +479,7 @@ func TestTransformRequestPlacesToolResultsBeforeUserText(t *testing.T) {
 		},
 	}
 
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "kimi-k2.6"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -491,7 +529,7 @@ func TestTransformRequestSkipsReasoningEffortWhenThinkingDisabled(t *testing.T) 
 		ModelID:         "deepseek-v4-pro",
 		ReasoningEffort: "max",
 		Thinking:        json.RawMessage(`{"type":"disabled"}`),
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -522,7 +560,7 @@ func TestTransformRequestOmitsPlaceholderForDeepSeek(t *testing.T) {
 	}
 
 	// DeepSeek should NOT get a placeholder when there's no thinking history
-	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
@@ -566,7 +604,7 @@ func TestTransformRequestDeepSeekPlaceholderWithThinkingHistory(t *testing.T) {
 		ModelID:         "deepseek-v4-flash",
 		ReasoningEffort: "high",
 		Thinking:        json.RawMessage(`{"type":"enabled"}`),
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("TransformRequest() error = %v", err)
 	}

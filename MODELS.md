@@ -357,6 +357,74 @@ Critical review → GLM-5.1 (rarely)
 4. **MiniMax M2.5 for long context** — 6,300 req/$12 with 1M context is amazing value
 5. **Monitor your usage** in the [OpenCode console](https://opencode.ai/auth)
 
+## Complexity Analysis System
+
+oc-go-cc automatically analyzes each request's complexity using 6 dimensions to route it to the appropriate model. This ensures cheap models handle simple tasks while expensive models are reserved for genuinely complex work.
+
+### Complexity Levels
+
+| Total Score | Level | Recommended Model | Scenario |
+|-------------|-------|------------------|----------|
+| 0~40 | **simple** | Qwen3.5 Plus | `fast` |
+| 41~60 | **medium** | Kimi K2.6 | `default` |
+| 61~80 | **complex** | GLM-5 | `think` |
+| 81~100 | **extreme** | GLM-5.1 | `complex` |
+
+### 6 Scoring Dimensions
+
+| Dimension | Weight | Scoring Rules |
+|----------|--------|---------------|
+| **Token Usage** | 30 pts | >70%→30, 50%~70%→20, 25%~50%→10, <25%→0 |
+| **Constraints** | 20 pts | ≥15→20, 8~14→13, 4~7→7, 1~3→3, 0→0 |
+| **Memory Load** | 10 pts | ≥8→10, 4~7→6, 1~3→3, 0→0 |
+| **File Scope** | 15 pts | >15/>800→15, 8~15/400~800→10, 3~7/100~400→5, <3/<100→0 |
+| **Conversation** | 10 pts | >15/>12→10, 10~15/8~12→7, 5~9/4~7→3, <5/<4→0 |
+| **Logic Steps** | 15 pts | >12→15, 8~12→10, 4~7→5, <4→0 |
+
+### Constraint Keywords (Strict Detection)
+
+**Chinese:** `必须`, `禁止`, `遵循`, `不得`, `保证`  
+**English:** `must not`, `shall not`, `forbidden`, `never use/modify/delete/execute`, `must implement/follow/use/adhere/ensure/comply`
+
+Constraints are only counted when they appear as explicit restriction patterns, preventing false positives from casual conversation.
+
+### Conversation Scoring (Turns Only)
+
+Conversation scoring is based on **user turns** only, not tool count. Tool-heavy requests (like Claude Code with 80+ tools) won't automatically get high conversation scores.
+
+### Routing Priority
+
+```
+1. Long Context (> threshold tokens) → long_context scenario
+2. Model Tier (sonnet → think, haiku → fast)
+3. Simple Read-Only Tools (explore, search, grep, read, ls, cat, etc.) → fast
+4. Simple Message Patterns (list directory, what is, cat file, etc.) → fast
+5. Complex Write Tools (write, edit, execute, delete, bash, etc.) → default/think/complex
+6. Complexity Analysis → routes based on score:
+   - 0~40 simple → fast (if no write tools)
+   - 41~60 medium → default
+   - 61~80 complex → think
+   - 81~100 extreme → complex
+```
+
+### Simple Read-Only Patterns
+
+**Tools:** `explore`, `search`, `grep`, `read`, `view`, `cat`, `ls`, `list`, `find`, `fetch`, `get`, `query`, `inspect`
+
+**Message Patterns:** `list directory`, `ls -`, `show file`, `view file`, `cat file`, `what is this`, `tell me about`, `check status`
+
+### Complex Write Patterns
+
+**Tools:** `write`, `edit`, `delete`, `remove`, `execute`, `run`, `bash`, `shell`, `create`, `modify`, `update`
+
+Requests with any write tools will route to at least `default` scenario, regardless of complexity score.
+
+### Example Log Output
+
+```
+routing request scenario=complex model=glm-5 tokens=9795 scenario_reason="complexity score 78 (complex): token_usage=20/30, constraints=13/20, memory=6/10, files=10/15, conversation=7/10, logic_steps=15/15 (Recommand GLM-5)"
+```
+
 ## See Also
 
 - [OpenCode Go Documentation](https://opencode.ai/docs/go/)

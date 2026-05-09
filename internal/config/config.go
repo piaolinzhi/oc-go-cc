@@ -26,6 +26,7 @@ type ModelConfig struct {
 	ContextThreshold int             `json:"context_threshold"`
 	ReasoningEffort  string          `json:"reasoning_effort"`
 	Thinking         json.RawMessage `json:"thinking,omitempty"`
+	SetCacheKey      bool            `json:"set_cache_key,omitempty"`
 }
 
 // ProviderConfig defines configuration for a single provider.
