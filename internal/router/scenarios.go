@@ -72,7 +72,6 @@ func DetectScenario(messages []MessageContent, tokenCount int, cfg *config.Confi
 }
 
 func DetectScenarioWithComplexity(compReq *complexity.Request, cfg *config.Config, modelID string) ScenarioResult {
-	threshold := getLongContextThreshold(cfg)
 	if compReq == nil {
 		return ScenarioResult{
 			Scenario:   ScenarioFast,
@@ -92,6 +91,7 @@ func DetectScenarioWithComplexity(compReq *complexity.Request, cfg *config.Confi
 
 	tokenCount := result.Metrics.TotalTokens
 
+	threshold := getLongContextThreshold(cfg)
 	if tokenCount > threshold {
 		return ScenarioResult{
 			Scenario:   ScenarioLongContext,
@@ -166,14 +166,6 @@ func DetectScenarioWithComplexity(compReq *complexity.Request, cfg *config.Confi
 				TokenCount: tokenCount,
 				Reason:     fmt.Sprintf("complexity score %d (medium): has complex keywords (Recommand GLM-5)", result.TotalScore),
 			}
-		}
-	}
-
-	if hasActualSimpleToolCalls(compReq) || hasSimpleMessagePattern(compReq) {
-		return ScenarioResult{
-			Scenario:   ScenarioFast,
-			TokenCount: tokenCount,
-			Reason:     fmt.Sprintf("simple read-only operation detected (Recommand Qwen3.5 Plus)"),
 		}
 	}
 
