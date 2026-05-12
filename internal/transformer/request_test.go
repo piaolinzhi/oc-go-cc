@@ -636,3 +636,91 @@ func mustJSONBytes(t *testing.T, v any) json.RawMessage {
 	}
 	return json.RawMessage(b)
 }
+
+func TestTransformRequest_NonDeepSeekNoAutoThinking(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "glm-5",
+	}, false)
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if openaiReq.Thinking != nil {
+		t.Errorf("Thinking = %s, want nil for non-DeepSeek model without thinking config", string(openaiReq.Thinking))
+	}
+	if openaiReq.ReasoningEffort != nil {
+		t.Errorf("ReasoningEffort = %v, want nil for non-DeepSeek model without reasoning_effort config", *openaiReq.ReasoningEffort)
+	}
+}
+
+func TestTransformRequest_NonDeepSeekWithThinkingHistory_NoAutoInject(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"think about this"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"thinking","thinking":"Let me think..."},
+					{"type":"text","text":"I considered it"}
+				]`),
+			},
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "glm-5",
+	}, false)
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if openaiReq.Thinking != nil {
+		t.Errorf("Thinking = %s, want nil for non-DeepSeek model (glm-5) even with thinking history", string(openaiReq.Thinking))
+	}
+	if openaiReq.ReasoningEffort != nil {
+		t.Errorf("ReasoningEffort = %v, want nil for non-DeepSeek model without reasoning_effort config", *openaiReq.ReasoningEffort)
+	}
+}
+
+func TestTransformRequest_NonDeepSeekWithExplicitConfig(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:         "glm-5",
+		ReasoningEffort: "high",
+		Thinking:        json.RawMessage(`{"type":"enabled"}`),
+	}, false)
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if openaiReq.Thinking == nil {
+		t.Error("Thinking = nil, want non-nil when explicitly configured")
+	}
+	if openaiReq.ReasoningEffort == nil {
+		t.Error("ReasoningEffort = nil, want non-nil when explicitly configured")
+	}
+}

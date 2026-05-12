@@ -2,11 +2,18 @@ package router
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 
 	"oc-go-cc/internal/complexity"
 	"oc-go-cc/internal/config"
 )
+
+var systemReminderRe = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
+
+func stripSystemReminders(text string) string {
+	return strings.TrimSpace(systemReminderRe.ReplaceAllString(text, ""))
+}
 
 type Scenario string
 
@@ -243,9 +250,14 @@ var simpleReadOnlyTools = []string{
 	"list",
 	"find",
 	"fetch",
-	"get",
 	"query",
 	"inspect",
+	"glob",
+}
+
+func isSimpleToolName(toolName, pattern string) bool {
+	lower := strings.ToLower(toolName)
+	return lower == pattern || strings.HasPrefix(lower, pattern+"_") || strings.HasPrefix(lower, pattern+"-")
 }
 
 var simpleMessagePatterns = []string{
@@ -287,9 +299,8 @@ func isSimpleToolOnly(req *complexity.Request) bool {
 		return false
 	}
 	for _, tool := range req.Tools {
-		name := strings.ToLower(tool.Name)
 		for _, t := range simpleReadOnlyTools {
-			if strings.Contains(name, t) {
+			if isSimpleToolName(tool.Name, t) {
 				return true
 			}
 		}
@@ -301,16 +312,19 @@ func hasActualSimpleToolCalls(req *complexity.Request) bool {
 	if req == nil {
 		return false
 	}
-	for _, msg := range req.Messages {
-		for _, block := range msg.Blocks {
-			if block.Type == "tool_use" {
-				name := strings.ToLower(block.Name)
-				for _, t := range simpleReadOnlyTools {
-					if strings.Contains(name, t) {
-						return true
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		msg := req.Messages[i]
+		if msg.Role == "user" {
+			for _, block := range msg.Blocks {
+				if block.Type == "tool_use" {
+					for _, t := range simpleReadOnlyTools {
+						if isSimpleToolName(block.Name, t) {
+							return true
+						}
 					}
 				}
 			}
+			return false
 		}
 	}
 	return false
@@ -320,10 +334,16 @@ func hasSimpleMessagePattern(req *complexity.Request) bool {
 	if req == nil {
 		return false
 	}
-	allText := strings.ToLower(strings.Join(extractAllTexts(req), " "))
-	for _, pattern := range simpleMessagePatterns {
-		if strings.Contains(allText, pattern) {
-			return true
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		msg := req.Messages[i]
+		if msg.Role == "user" {
+			text := strings.ToLower(stripSystemReminders(msg.Content))
+			for _, pattern := range simpleMessagePatterns {
+				if strings.Contains(text, pattern) {
+					return true
+				}
+			}
+			return false
 		}
 	}
 	return false
@@ -336,7 +356,7 @@ func hasComplexKeywordsInCurrentMessage(req *complexity.Request) bool {
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		msg := req.Messages[i]
 		if msg.Role == "user" {
-			text := strings.ToLower(msg.Content)
+			text := strings.ToLower(stripSystemReminders(msg.Content))
 			for _, keyword := range complexKeywords {
 				if strings.Contains(text, keyword) {
 					return true

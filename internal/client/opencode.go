@@ -90,7 +90,7 @@ func (c *OpenCodeClient) getEndpoint(modelID string, providerName string) Endpoi
 	var p provider.Provider
 	var err error
 
-	c.logger.Debug("getEndpoint called", "modelID 【", modelID, "】 providerName【", providerName,"】")
+	c.logger.Debug("getEndpoint called", "modelID", modelID, "providerName", providerName)
 
 	// Try to get provider by name if specified
 	if providerName != "" {

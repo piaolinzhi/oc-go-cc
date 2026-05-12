@@ -462,3 +462,99 @@ func TestHasComplexKeywords_Chinese_Deploy(t *testing.T) {
 		t.Errorf("Expected ScenarioThink for Chinese deploy, got %s (reason: %s)", result.Scenario, result.Reason)
 	}
 }
+
+func TestStripSystemReminders_Basic(t *testing.T) {
+	input := "<system-reminder>create a file and execute bash shell</system-reminder>\nhello"
+	got := stripSystemReminders(input)
+	if strings.Contains(got, "system-reminder") {
+		t.Errorf("Expected system-reminder to be stripped, got: %s", got)
+	}
+	if !strings.Contains(got, "hello") {
+		t.Errorf("Expected 'hello' to remain, got: %s", got)
+	}
+}
+
+func TestStripSystemReminders_Multiple(t *testing.T) {
+	input := "<system-reminder>first\ncreate\necho\n</system-reminder>hello<system-reminder>second\nexecute\nshell\n</system-reminder>"
+	got := stripSystemReminders(input)
+	if strings.Contains(got, "system-reminder") {
+		t.Errorf("Expected all system-reminders to be stripped, got: %s", got)
+	}
+	if !strings.Contains(got, "hello") {
+		t.Errorf("Expected 'hello' to remain, got: %s", got)
+	}
+}
+
+func TestStripSystemReminders_NoReminders(t *testing.T) {
+	input := "hello world"
+	got := stripSystemReminders(input)
+	if got != "hello world" {
+		t.Errorf("Expected unchanged text, got: %s", got)
+	}
+}
+
+func TestHelloWithSystemReminder_NotComplex(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "<system-reminder>\nYou have superpowers.\n\n**Below is the full content of your 'using-superpowers' skill**\n\nWhen you think there is even a 1% chance a skill might apply, you ABSOLUTELY MUST invoke the Skill tool.\n\nTools: Bash, Shell, Execute, Create file\n</system-reminder>\n\nhello"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for hello with system-reminder, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestHelloWithSystemReminder_NotSimplePattern(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "<system-reminder>\nUse cat /etc/hosts to check. ls -la to list files.\n</system-reminder>\n\nhello"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for hello with system-reminder containing simple patterns, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestRealHello_IsFast(t *testing.T) {
+	compReq := &complexity.Request{
+		Model: "claude-3-5-sonnet-20241022",
+		Messages: []complexity.Message{
+			{Role: "user", Content: "hello"},
+		},
+	}
+	result := DetectScenarioWithComplexity(compReq, mockConfig(), "")
+	if result.Scenario != ScenarioFast {
+		t.Errorf("Expected ScenarioFast for plain hello, got %s (reason: %s)", result.Scenario, result.Reason)
+	}
+}
+
+func TestIsSimpleToolName(t *testing.T) {
+	tests := []struct {
+		toolName string
+		pattern  string
+		want     bool
+	}{
+		{"read", "read", true},
+		{"Read", "read", true},
+		{"read_file", "read", true},
+		{"ReadFile", "read", false},
+		{"search", "search", true},
+		{"SearchCodebase", "search", false},
+		{"get", "get", true},
+		{"GetDiagnostics", "get", false},
+		{"grep", "grep", true},
+		{"Grep", "grep", true},
+		{"explore", "explore", true},
+		{"Explore", "explore", true},
+	}
+	for _, tt := range tests {
+		got := isSimpleToolName(tt.toolName, tt.pattern)
+		if got != tt.want {
+			t.Errorf("isSimpleToolName(%q, %q) = %v, want %v", tt.toolName, tt.pattern, got, tt.want)
+		}
+	}
+}
